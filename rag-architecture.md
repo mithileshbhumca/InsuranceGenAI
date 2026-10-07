@@ -179,6 +179,28 @@ The RAG system draws on multiple sources:
 
 These are not all treated equally. Some are internal and role-restricted. Others are public-facing or advisor-facing only.
 
+### Source classes and authority
+
+- **Unstructured evidence:** approved policy/procedure PDFs, brochures, manuals, FAQs and regulatory sources. The approved source repository is authoritative; Blob Storage retains the immutable ingestion copy.
+- **Structured facts:** customer, policy lifecycle, claims status and eligibility inputs come from their respective enterprise systems and governed rules services at request time.
+- **Derived stores:** MongoDB holds document/chunk lineage and processing/version metadata; Qdrant holds rebuildable embeddings and retrieval payloads; Redis is an ephemeral cache/session layer. None overrides source systems or approved documents.
+
+---
+
+## 4.1 Document formats and extraction boundaries
+
+The ingestion design targets text PDFs, scanned PDFs, and table/form-heavy documents. Azure AI Document Intelligence is selected to combine OCR with layout, table, and form extraction; a plain text extractor would lose important relationships and page/layout provenance.
+
+| Content | Intended handling | Boundary / control |
+|---|---|---|
+| Text PDF | Extract text and layout, normalize, retain page anchors | Validate page coverage and citation offsets |
+| Scanned PDF | OCR and layout extraction via Document Intelligence | Confidence/coverage gates; quarantine poor OCR rather than indexing it as trusted evidence |
+| Tables and forms | Extract cells/structure and retain heading, row/column, page and section association | Validate table completeness and numeric/label alignment; do not flatten if it changes meaning |
+| Images, including embedded policy images | Process only when the selected Document Intelligence model/input path supports the format and task | The supported MIME/size allowlist and visual-semantic coverage are not defined here; charts, photos, handwriting, or visual damage interpretation are not guaranteed and require a separately evaluated workflow |
+| Unsupported/corrupt/encrypted files | Reject or quarantine with operator-visible reason | Do not silently publish partial extraction |
+
+The exact upload format allowlist, file-size limits, password-protected-file policy, language coverage, and OCR confidence thresholds are implementation gaps and must be set in the ingestion contract. Do not describe image interpretation as supported solely because OCR/layout extraction exists.
+
 ---
 
 ## 5. Document Ingestion Pipeline
@@ -224,6 +246,10 @@ Insurance documents are often long and clause-heavy. Therefore, simple chunking 
 - Keep table data and policy terms together when they belong to the same clause
 - Avoid splitting across legal definitions or exclusions if it creates ambiguity
 - Add metadata at chunk level
+- Prefer deterministic structure-aware chunking from Document Intelligence headings, paragraphs, clause IDs, table cells, page boundaries, and document hierarchy; use semantic boundary detection only where structure is absent or unreliable
+- Retain raw extracted text and stable source offsets so chunks and later compressed passages can resolve to exact page/section citations
+- Add ingestion quality gates for missing pages, low OCR confidence, broken tables, empty/oversized chunks, duplicate chunks, missing required metadata, and invalid provenance; quarantine rather than index failures
+- preserve explicit references such as “see Section 8.2” as extracted text and, where verified, normalized reference metadata; cross-document reference resolution is not currently specified as a working service
 
 ### Example chunk metadata
 
@@ -239,11 +265,19 @@ Insurance documents are often long and clause-heavy. Therefore, simple chunking 
 - extraction_quality_score
 - created_at
 
+### Chunk, embedding, and re-index versioning
+
+Persist document/source version, parser and normalization version, chunker version, metadata schema version, embedding model/version and dimension, and index generation ID. Do not mix incompatible embedding spaces in one collection. Stage reprocessing into a non-active generation, compare expected/actual chunk IDs and counts with MongoDB metadata, run retrieval evaluation, and activate only after consistency checks pass. Preserve the previously approved generation for rollback until retention/effective-date rules allow its removal.
+
+### Cross-document references and citation integrity
+
+Keep each chunk linked to an immutable source document/version, stable chunk ID, page, section/clause path, and character/source offsets. Preserve references to other clauses/documents during extraction; follow a reference only when the target has been resolved to an approved current source and passes the same user/tenant, jurisdiction, effective-date, and version filters. Cite every used source independently. A generic textual reference (“see Section X”) is not proof the target was retrieved or that the target is accessible. Automated reference resolution and link coverage are gaps until implemented and measured.
+
 ---
 
 ## 7. Hybrid Retrieval Strategy
 
-Hybrid retrieval performs best for insurance documents.
+Hybrid retrieval is a strong candidate for insurance documents and should be retained only with synchronized indexing and measured quality gains over the semantic-only baseline.
 
 ### 7.1 Semantic search
 Semantic retrieval uses embeddings to find conceptually similar text.
@@ -277,6 +311,50 @@ Examples:
 ### 7.4 Why hybrid retrieval matters
 Insurance questions often combine vague natural language with exact policy terminology. Semantic search alone is not enough; lexical + metadata filtering increases precision.
 
+### Recommended dense + lexical strategy
+
+Retain Qdrant for dense semantic retrieval and add a lexical/BM25 retriever where the corpus and platform support it. Use both with identical authorization, product, jurisdiction, effective-date, and version filters. Merge and deduplicate candidates with a rank-fusion method such as reciprocal rank fusion before the existing BGE cross-encoder. This helps exact clause IDs, defined terms, claim codes, product names, and amounts while semantic search handles paraphrases. If no lexical backend is deployed, describe and operate the system as semantic-only rather than claiming hybrid retrieval.
+
+### Qdrant index design, scale and alternatives
+
+Qdrant is retained as the dedicated vector store because the current design needs dense semantic retrieval with payload metadata filters and a separately operated lexical retriever where required. The intended ANN index is HNSW: it avoids exhaustive vector scans at larger corpus sizes, trading exactness and memory/build work for query speed. HNSW construction/search settings (`m`, `ef_construct`, `ef`, quantization, shard/replica layout) are not specified or benchmarked here; treat them as deployment tuning parameters, not established production values. Validate recall/latency/memory on the representative insurance corpus before changing them.
+
+Index payloads must include stable document/chunk IDs and the minimum validated product, jurisdiction, effective-date, version, language and authorization attributes needed by server-built filters. Index payload fields used for filtering deliberately; every request still derives filters from authenticated scope, not from model output. Replicas/shards and snapshots are deployment choices subject to consistency, recovery, and capacity testing.
+
+| Alternative | When to compare | Trade-off against this design |
+|---|---|---|
+| Azure AI Search | Azure-managed lexical + vector retrieval and integrated enterprise search are priorities | May reduce separate lexical-index/fusion operations; compare feature fit, filtering semantics, ranking control, cost and portability |
+| pgvector | Vectors are modest in scale and transactional SQL joins are a strong requirement | Simpler single-store operations may come with different ANN/filtering and scale characteristics |
+| Weaviate, Milvus, Pinecone or another vector service | Managed operations, ecosystem, deployment model or existing enterprise standard favors it | Compare filter correctness, tenant isolation, backup/restore, availability, latency, total cost and migration path |
+
+No alternative is selected by name alone. Qdrant remains the documented choice; changing it requires a workload-specific benchmark and operational comparison. “Thousands of documents” is feasible as a design target but is not a measured capacity result. Corpus size is not enough to size the index: chunk count, vector dimensions, payload indexes, concurrency, filter selectivity and replication drive capacity.
+
+```mermaid
+flowchart TD
+    QUERY[Authorized query and trusted scope] --> FILTER[Build ACL, version, date and product filters]
+    FILTER --> HNSW[Qdrant HNSW ANN search]
+    FILTER --> LEX[Optional synchronized BM25 search]
+    HNSW --> FUSE[Rank fusion and deduplication]
+    LEX --> FUSE
+    FUSE --> BGE[BGE cross-encoder reranking]
+    BGE --> VALID[Validate source version, ACL and provenance]
+    VALID -->|Pass| CONTEXT[Evidence with stable citation IDs]
+    VALID -->|Fail| ABSTAIN[No-answer or review]
+    HNSW -->|Unavailable| RETRY[Bounded retry / circuit breaker]
+    RETRY -->|Exhausted| ABSTAIN
+```
+
+### Query routing and retrieval expansion policy
+
+- **Self-contained simple FAQ:** direct retrieval; no query-rewrite or multi-query LLM call.
+- **Ambiguous follow-up/pronoun:** conversation-aware rewriting from the bounded history defined above; ask clarification below the resolution-confidence threshold.
+- **Complex multi-facet comparison or compound claim question:** optional capped multi-query decomposition, only when a planner determines distinct facets need separate evidence. Preserve the same ACL and document-version filters for each subquery, then fuse and deduplicate.
+- **Policy query:** route to policy/product corpus with effective-date and jurisdiction filters.
+- **Claim query:** obtain claim status from the claims system of record and retrieve claim procedures/policy clauses separately; do not answer claim status from documents.
+- **Uncertain domain:** use deterministic routing rules or a low-cost classifier with confidence; clarify or escalate instead of broad unrestricted search.
+
+Multi-query is not the default query expansion method. It can increase candidate volume and latency; cap the number of subqueries and measure recall gain against precision and cost.
+
 ---
 
 ## 8. Re-ranking Layer
@@ -293,26 +371,38 @@ After retrieval, the system should rerank candidate chunks to keep only the stro
 
 Naive vector search often retrieves many nearby but irrelevant chunks. Re-ranking reduces noise and dramatically improves answer quality for legal and policy content.
 
+### MMR and contextual compression
+
+- **MMR:** Optional, not a default extra stage. Apply conservatively between candidate fusion and BGE only when evaluation shows duplicate-heavy results. It reduces near-duplicates but can remove complementary clauses, exceptions, or repeated wording that is legally meaningful.
+- **Contextual compression:** Optional after BGE ranking and before final context assembly when long chunks exceed the token budget. Prefer extractive span selection with original chunk IDs and source offsets. Retain the source chunk as the authority and validate that conditions, exceptions, amounts, and qualifiers remain available. Avoid LLM-generated summaries as evidence.
+- **BGE:** Retain as the primary relevance reranker. It complements dense/lexical retrieval and optional diversity; it cannot recover missed candidates or certify policy correctness.
+
 ### Query Retrieval Pipeline
 
 ```mermaid
 flowchart TD
     U[Customer or advisor query] --> API[Authenticated assistant API]
     API --> ACL[Authorize user and resolve tenant / customer scope]
-    ACL --> HISTORY[Load bounded recent turns and summary]
-    ACL --> HISTRET[Retrieve relevant older turns<br/>same authorized conversation]
-    U --> REWRITE[Conversation-aware query rewriting]
-    HISTORY --> REWRITE
+    ACL --> QN[Classify intent and query complexity]
+    QN --> ROUTE{Self-contained, ambiguous,<br/>or complex query?}
+    ROUTE -- Self-contained --> DIRECT[Keep original query]
+    ROUTE -- Ambiguous follow-up --> HISTORY[Load bounded recent turns and summary]
+    ROUTE -- Ambiguous follow-up --> HISTRET[Retrieve relevant older turns<br/>same authorized conversation]
+    HISTORY --> REWRITE[Conditional conversation-aware rewrite]
     HISTRET --> REWRITE
+    ROUTE -- Complex multi-facet --> MULTI[Optional capped multi-query decomposition]
     REWRITE --> RESOLVE{Follow-up reference resolved?}
     RESOLVE -- No --> CLARIFY[Ask for clarification]
-    RESOLVE -- Yes --> QN[Create standalone query<br/>retain original for audit]
-    QN --> CTX[Customer Context Service]
+    RESOLVE -- Yes --> STANDALONE[Create standalone query<br/>retain original for audit]
+    DIRECT --> SEARCHREQ[Authorized retrieval request]
+    STANDALONE --> SEARCHREQ
+    MULTI --> SEARCHREQ
+    SEARCHREQ --> CTX[Customer Context Service]
     CTX --> SYS[Policy / claims systems of record]
     CTX --> FILTER[Build metadata and effective-date filters]
     ACL --> FILTER
-    QN --> CACHE{Authorized retrieval cache hit?}
-    CACHE -- Yes --> CACHED[Cached candidate chunks]
+    SEARCHREQ --> CACHE{Authorized retrieval cache hit?}
+    CACHE -- Yes --> CACHED[Cached final candidate set]
     CACHE -- No --> SEARCH[Run hybrid retrieval]
     FILTER --> SEARCH
     SEARCH --> HEALTH{Search services healthy?}
@@ -325,11 +415,17 @@ flowchart TD
     UNAVAILABLE --> ESC[No-answer or human-review path]
     DENSE --> FUSE[Merge and deduplicate candidates]
     LEX --> FUSE
-    FUSE --> RANK[Cross-encoder reranker]
-    RANK --> GATE{Access, version and relevance checks}
+    FUSE --> DIVERSITY{Duplicate-heavy candidates?}
+    DIVERSITY -- Yes, if evaluated --> MMR[Conservative MMR]
+    DIVERSITY -- No --> RANK[Cross-encoder reranker]
+    MMR --> RANK
+    RANK --> GATE
     CACHED --> GATE
-    GATE -- Pass --> EVID[Ranked evidence chunks]
+    GATE{Access, version and relevance checks} -- Pass --> SIZE{Evidence exceeds context budget?}
     GATE -- Fail / low confidence --> ESC[No-answer or human-review path]
+    SIZE -- Yes --> COMPRESS[Optional extractive compression]
+    SIZE -- No --> EVID[Ranked evidence chunks]
+    COMPRESS --> EVID
     EVID --> TRACE[Record retrieval trace and scores]
     ESC --> TRACE
     CLARIFY --> TRACE
@@ -339,7 +435,7 @@ flowchart TD
     TRACE --> NEXT[Pass evidence or escalation status to response flow]
 ```
 
-The query pipeline authenticates the caller and resolves customer and tenant scope before loading any conversation history. A bounded recent-turn window, compact summary, and scoped relevant-history retrieval feed a conversation-aware rewriter that produces a standalone query; if the follow-up is still ambiguous, the system asks for clarification instead of guessing. The original wording is retained for audit. Customer context then produces metadata filters for product, jurisdiction, effective date, document version, and permissions. Dense search in Qdrant handles paraphrases, while an optional lexical index finds exact clause terms; candidate fusion and cross-encoder reranking improve precision. Access, version, and relevance gates prevent unauthorized or stale evidence from proceeding. Redis can reduce repeat-query latency only when the cache key includes authorization, conversation, and policy scope. Retrieval scores and source identifiers are traced for evaluation and audit; weak or disallowed evidence leads to an explicit no-answer or review status rather than forced generation.
+The query pipeline authenticates the caller and resolves customer and tenant scope before any conversation history is loaded. Self-contained questions go directly to retrieval; only ambiguous follow-ups load a bounded recent-turn window, compact summary, and scoped relevant-history before conversation-aware rewriting. If the reference remains ambiguous, the system asks for clarification instead of guessing. The original wording is retained for audit. Customer context produces metadata filters for product, jurisdiction, effective date, document version, and permissions. Dense search in Qdrant handles paraphrases, while an optional lexical index finds exact clause terms; candidate fusion, optional measured diversity filtering, and cross-encoder reranking improve precision. Access, version, and relevance gates prevent unauthorized or stale evidence from proceeding. Redis can reduce repeat-query latency only when the cache key includes authorization, conversation, and policy scope. Retrieval scores and source identifiers are traced for evaluation and audit; weak or disallowed evidence leads to an explicit no-answer or review status rather than forced generation.
 
 ---
 
@@ -356,9 +452,33 @@ Once the relevant chunks are selected, the system assembles a grounded context f
 - top metadata-filtered chunks
 - customer policy details
 - claim-specific context
+- separately identified business-rule outputs and reason codes
 - answer-style rules and formatting instructions
 
 Conversation history is context for resolving references and maintaining continuity, not evidence for policy claims. Do not pass the complete transcript. The prompt builder enforces the model-specific token budget defined in [Conversation History & Context Management](#conversation-history--context-management), preserving system/safety instructions, the current question, required policy qualifications, and citations before optional older history.
+
+### Context trust and priority
+
+Pass each source as a distinct typed block, not as an undifferentiated transcript:
+
+1. **System/security instructions:** immutable policy, safety, access boundaries, and response contract.
+2. **Current user request:** original message plus a validated standalone rewrite; user intent never grants data access.
+3. **Customer-specific facts:** fresh, authorized facts from customer/policy/claims systems of record, with timestamps and provenance.
+4. **Business-rule results:** versioned rule output and reason codes from the governed deterministic rule service.
+5. **Retrieved policy evidence:** approved document version, jurisdiction/effective date, exact chunk and citation metadata.
+6. **Conversation history:** selected relevant turns and summary for reference resolution only; assistant text is untrusted continuity context, not a source of policy or customer truth.
+7. **Output format:** structured answer fields and citation requirements.
+
+This ordering is a prompt-layout/trust boundary, not an instruction to silently settle contradictions. If authoritative policy text, customer data, and a business rule conflict or have incompatible effective dates, stop and clarify/escalate. Do not let conversation memory override systems of record, active policy documents, authorization, or governed rule results.
+
+The response contract should distinguish:
+
+- `policy_facts`: statements supported by approved retrieved policy chunks and citations
+- `customer_facts`: customer-specific facts from authorized systems of record, with freshness/provenance
+- `business_rule_results`: eligibility or workflow outcomes from the versioned rule service, with reason codes
+- `explanation_or_recommendation`: model-generated explanation only, bounded by the preceding evidence and approved suitability constraints
+
+Never present model-generated explanation as a contractual fact or imply that a recommendation is a binding coverage/eligibility decision.
 
 ### Example of context payload
 
@@ -369,23 +489,35 @@ Conversation history is context for resolving references and maintaining continu
   "conversation_context": {
     "summary": "User is asking about Health Plus inpatient coverage.",
     "relevant_turn_ids": ["turn-18", "turn-19"],
-    "provenance": "user-selected product; policy terms must be verified from current source documents"
+    "authority": "continuity-only"
   },
-  "customer_context": {
+  "customer_facts": {
     "policy_id": "POL-1245",
     "product": "Health Plus",
-    "policy_year": 2025,
-    "coverage_type": "inpatient"
+    "coverage_type": "inpatient",
+    "verified_at": "2025-01-01T00:00:00Z",
+    "source": "policy-system"
   },
+  "business_rule_results": [],
   "resolved_constraints": {
     "jurisdiction": "authorized policy jurisdiction",
     "policy_version": "current version for effective date"
   },
   "retrieved_chunks": [
-    {"doc_id": "policy-health-2025", "chunk_id": "c-341", "score": 0.94}
+    {
+      "doc_id": "policy-health-2025",
+      "chunk_id": "c-341",
+      "evidence_id": "ev-982",
+      "score": 0.94,
+      "section": "Waiting Periods",
+      "page": 14,
+      "version": "2025.01"
+    }
   ]
 }
 ```
+
+The example is illustrative; production payloads should use typed schemas, protect identifiers, and avoid copying redundant fields when building the model prompt.
 
 ---
 
@@ -398,6 +530,8 @@ The LLM should answer only from the retrieved context and policy rules. It shoul
 - mention uncertainty where policy language is unclear
 - avoid assuming customer coverage without evidence
 - produce structured responses when needed
+- label policy facts, customer-specific facts, deterministic rule outcomes, and model-generated explanations separately
+- emit only citation IDs supplied in the evidence bundle; citation URLs/page labels are resolved and validated server-side
 
 ### Example answer behavior
 
@@ -485,6 +619,9 @@ Citations are not optional in an enterprise insurance assistant.
 - document version
 - page or chunk identifier
 - time of policy validity
+- stable evidence ID and mapping to the exact retrieved chunk/source offsets
+
+Treat model citation generation as reference selection, not proof. A server-side validator must reject unknown, unauthorized, stale, or mismatched citation IDs and ensure material policy claims have supporting evidence. Validate customer facts and rule outputs against their own system-of-record provenance; policy citations do not substantiate customer-specific facts.
 
 ### Example
 
@@ -501,23 +638,64 @@ This helps with:
 
 ## 13. RAG Evaluation Strategy
 
-A production-grade RAG system needs systematic evaluation.
+A production-grade RAG system needs repeatable offline evaluation and separate online operational monitoring. Ragas is recommended for offline evaluation of curated datasets. LangSmith is optional for LLM-specific experiments and trace inspection; OpenTelemetry, Azure Monitor, and Application Insights remain the production observability system.
 
-### Retrieval metrics
+### Offline evaluation
 
-- recall@k
-- ndcg@k
-- MRR
-- precision@k
-- document hit rate
+Maintain a versioned, SME-reviewed dataset containing query intent, user/customer scope, expected evidence IDs, policy version/effective date, expected answer facts, expected citations, and expected clarification/escalation outcomes. Run evaluations when changing extraction, chunking, metadata, embeddings, hybrid fusion, MMR, BGE, compression, prompts, models, or conversation rewriting.
 
-### Answer quality metrics
+Use Ragas selectively for:
+
+- **Faithfulness:** Are answer claims supported by retrieved context? Pair with deterministic citation checks.
+- **Answer Relevancy:** Does the response address the actual user intent, including correct clarification or abstention?
+- **Context Precision:** Are retrieved chunks useful and relevant? Evaluate alongside recall to avoid dropping exclusions.
+- **Context Recall:** Does the retrieved set contain required evidence? Requires complete reference evidence labeled by insurance SMEs.
+
+Keep deterministic checks in the release gate for citation ID resolution, authorization filters, source version/effective date, response schema, required disclosures, and token/timeout limits. Ragas/LLM-judge scores are estimates: pin evaluator/model/metric versions, calibrate against human review, and do not approve a release based on a single aggregate score.
+
+Additional retrieval metrics may include recall@k, precision@k, nDCG, MRR, and document hit rate, segmented by product, jurisdiction, query type, and policy version.
+
+### Online / production monitoring
+
+The user request path uses deterministic controls and does not wait for Ragas or a model judge. OTel/Azure Monitor/Application Insights measure request and stage latency, errors, dependency health, token cost, retrieval/reranker scores, index freshness, cache behavior, no-hit/low-confidence, citation rejection, clarification, guardrail, and escalation rates.
+
+If model-judged Faithfulness or Answer Relevancy is used online, run it asynchronously on a privacy-reviewed sample with an explicit budget. Store the evaluator version and sample provenance; evaluator failure must not block the user response. Use sampled human review and user/advisor feedback to calibrate signals.
+
+### LangSmith placement
+
+LangSmith may be used in development/staging to inspect traces, compare prompts/models, and manage experiment datasets. It overlaps with OTel/Azure tracing, so it is optional, not another mandatory production telemetry plane. If approved for production trace inspection, export only minimized/redacted content; define data residency, access, retention, sampling, and outage behavior. User requests must not depend on LangSmith availability.
+
+### Feedback-to-improvement loop
+
+User/advisor feedback and sampled human review are signals for investigation, not automatic labels or automatic model/prompt updates. A reviewer should confirm the issue and expected evidence/answer, redact or minimize sensitive data, and add an approved example to a versioned regression set. Candidate retrieval, prompt, chunker, model, or routing changes run through offline evaluation and release approval before rollout.
+
+```mermaid
+flowchart LR
+    RESPONSE[Served answer and trace IDs] --> FEEDBACK[User/advisor feedback or sampled review]
+    FEEDBACK --> TRIAGE[Privacy screening and human triage]
+    TRIAGE -->|Confirmed and reproducible| GOLD[SME-approved versioned example]
+    TRIAGE -->|Unclear / sensitive| HOLD[Investigate or discard under policy]
+    GOLD --> EVAL[Ragas + deterministic regression suite]
+    CHANGE[Candidate retrieval / prompt / model change] --> EVAL
+    EVAL --> GATE{Quality, safety and latency gates pass?}
+    GATE -->|No| FIX[Revise or reject change]
+    FIX --> CHANGE
+    GATE -->|Yes| APPROVAL[Owner and compliance approval]
+    APPROVAL --> ROLLOUT[Canary rollout and OTel/Azure monitoring]
+    ROLLOUT -->|Regression| ROLLBACK[Rollback to known-good version]
+    ROLLOUT -->|Stable| MONITOR[Continue monitored operation]
+```
+
+This creates a controlled feedback → evaluation → improvement → regression-testing loop. Automated online learning, automatic prompt mutation, and direct writes from thumbs-up/down into a training corpus are not specified and should not be enabled without separate governance and validation.
+
+### Additional answer-quality signals
 
 - groundedness
 - citation correctness
 - answer faithfulness
 - refusal correctness
 - usefulness for customer or advisor workflow
+- intent-preservation and clarification correctness for multi-turn follow-ups
 
 ### Example evaluation scenarios
 
@@ -526,6 +704,9 @@ A production-grade RAG system needs systematic evaluation.
 - claim procedure question
 - policy exclusion question
 - answer requiring routing to a human advisor
+- simple FAQ routed directly without an unnecessary rewrite/model call
+- follow-up query with a correctly resolved antecedent and one with ambiguous antecedents
+- compound claim query with recall across policy evidence and claims-system facts
 
 ---
 
@@ -565,9 +746,12 @@ The RAG layer must enforce strict access rules.
 
 - user can only access authorized documents
 - customer data access follows RBAC/ABAC policies
+- conversation-history retrieval is scoped to the authenticated tenant, user, and conversation; stored turns and summaries are untrusted continuity context, not authorization or evidence
+- ACL, effective-date, and version filters are built from trusted identity and enterprise metadata, not inferred or widened by a model
 - documents with expired or superseded versions should not be used
 - PII should be masked before model execution when necessary
 - all retrievals and answers should be auditable
+- traces and evaluation exports are minimized/redacted and governed by retention, residency, and access policy
 
 No answer should be generated from a document the user is not allowed to access, even if it exists in the index.
 
@@ -595,24 +779,101 @@ RAG must scale across both user queries and ingestion workloads.
 
 ---
 
-## 17. RAG Architecture Decision Summary
+## 17. Final Recommended RAG Architecture
+
+```mermaid
+flowchart TD
+    subgraph INDEX[Indexing - asynchronous]
+        DOC[Approved document] --> DI[Azure AI Document Intelligence]
+        DI --> CHUNK[Structure-aware insurance chunking]
+        CHUNK --> META[Metadata + provenance + quality gates]
+        META --> EMB[Versioned embeddings]
+        EMB --> Q[(Qdrant)]
+        META --> M[(MongoDB lineage and processing state)]
+        Q --> ACT[Validate staged index and activate version]
+        M --> ACT
+    end
+
+    subgraph PRE[Pre-retrieval]
+        U[User query] --> ACL[Authorize user, tenant and customer]
+        ACL --> UNDERSTAND[Query understanding and domain routing]
+        UNDERSTAND --> ROUTE{Classify query}
+        ROUTE -- Self-contained --> DIRECT[Direct retrieval]
+        ROUTE -- Ambiguous follow-up --> HIST[Load bounded recent and relevant history]
+        HIST --> REWRITE[Conditional conversation-aware rewrite]
+        ROUTE -- Complex facets --> MULTI[Optional capped multi-query]
+    end
+
+    subgraph RETR[Retrieval]
+        DIRECT --> FILTER[ACL, product, jurisdiction and effective-date filters]
+        REWRITE --> FILTER
+        MULTI --> FILTER
+        FILTER --> DENSE[Qdrant dense search]
+        FILTER --> LEX[Optional BM25 / lexical search]
+        DENSE --> FUSE[Rank fusion and deduplication]
+        LEX --> FUSE
+        FUSE --> DIVERSITY{Duplicate-heavy candidates?}
+        DIVERSITY -- Yes, if evaluated --> MMR[Conservative MMR]
+        DIVERSITY -- No --> BGE[BGE cross-encoder reranking]
+        MMR --> BGE
+        BGE --> SIZE{Evidence exceeds context budget?}
+        SIZE -- Yes --> COMP[Optional extractive compression with source offsets]
+        SIZE -- No --> EVIDENCE[Ranked evidence]
+        COMP --> EVIDENCE
+    end
+
+    subgraph ANSWER[Augmentation and generation]
+        CUST[Authorized customer facts from systems of record] --> CTX
+        RULE[Governed business-rule results] --> CTX
+        EVIDENCE --> CTX[Typed prioritized context assembly]
+        HIST --> CTX
+        CTX --> PROMPT[Versioned grounded prompt and token budget]
+        PROMPT --> GPT[OpenAI GPT]
+        GPT --> NEMO[NeMo Guardrails]
+        NEMO --> VALID[Schema, provenance and citation validation]
+        VALID --> OUT[Answer, clarification, abstention or human review]
+    end
+
+    subgraph EVAL[Evaluation and monitoring]
+        GOLD[SME-reviewed dataset] --> RAGAS[Ragas offline evaluation]
+        RAGAS --> GATE[Release/change gate]
+        OTel[OTel + Azure Monitor / App Insights] --> DASH[Online dashboards and alerts]
+        OTel -. optional redacted traces .-> LS[LangSmith optional]
+    end
+```
+
+### Execution policy
+
+1. Keep Document Intelligence, Qdrant, MongoDB, conversation-aware history, LangGraph, GPT, NeMo, and server-side citation validation.
+2. Add structure-aware chunking, extraction/chunk quality gates, complete metadata/provenance, embedding-version tracking, staged index activation, and tested re-index rollback.
+3. Authorize and route every query. Use direct retrieval for self-contained simple questions; invoke query rewriting only for ambiguous follow-ups; invoke capped multi-query only for complex decomposable questions.
+4. Use Qdrant dense search plus a lexical/BM25 index where deployed, with identical ACL/version filters and rank fusion. Retain BGE; enable conservative MMR only when duplicate-heavy retrieval is demonstrated; compress extractively only when context size warrants it.
+5. Assemble separately typed system/security instructions, user query, customer facts, governed rule outputs, policy evidence, conversation history, and output contract. Conversation history is continuity context only and cannot override authoritative sources.
+6. Generate structured output that distinguishes retrieved policy facts, customer-specific facts, business-rule results, and model-generated explanation/recommendation. Resolve citations server-side and abstain/escalate on unsupported or conflicting facts.
+7. Run Ragas metrics offline on curated SME-reviewed evaluations; keep OTel/Azure online monitoring. LangSmith and online LLM-judge scoring remain optional, privacy-reviewed, asynchronous, and non-blocking.
+
+## 18. RAG Architecture Decision Summary
 
 The recommended architecture is:
 
 - Qdrant for vector storage and retrieval
-- metadata-aware filtering for policy relevance
-- hybrid retrieval for semantic + lexical matching
+- metadata-aware authorization, policy, jurisdiction, and version filtering
+- dense Qdrant + lexical/BM25 hybrid retrieval where deployed, fused before reranking
 - cross-encoder re-ranking for precision
+- structure-aware chunking, quality gates, versioned embeddings, and staged re-indexing
+- conditional query rewriting and domain routing; capped multi-query only for complex requests
+- optional MMR/compression only where evaluated gains justify complexity
 - evidence-grounded answer generation with citations
+- explicit separation of customer facts, policy facts, rule results, history, and model explanations
 - strict guardrails and access control
 - async ingestion from source documents to vector index
-- version-aware and auditable document processing
+- offline Ragas evaluation and online OTel/Azure monitoring; LangSmith optional
 
 This architecture gives the best balance of accuracy, safety, enterprise readiness, and explainability for an insurance assistant.
 
 ---
 
-## 18. Edge Case & Failure Handling
+## 19. Edge Case & Failure Handling
 
 RAG must fail closed whenever source quality, authorization, version, or grounding cannot be verified. The ingestion, retrieval, and response diagrams above show the primary quarantine, retry, no-answer, validation, and escalation paths.
 
@@ -669,6 +930,33 @@ RAG must fail closed whenever source quality, authorization, version, or groundi
 - **Fallback behavior:** Return a safe limitation or human-review path, never the unvalidated draft.
 - **Impact on the user/system:** The user may receive a delayed or limited answer; incorrect citations and unsupported coverage statements are withheld.
 - **Monitoring/alerting required:** Monitor validation rejection, regeneration, citation mismatch, groundedness, safety escalation, and model/prompt-version quality metrics.
+
+### Scenario: Hybrid retrievers disagree or lexical index is stale
+
+- **Why it can happen:** BM25/lexical indexing lags behind Qdrant, analyzers tokenize policy identifiers differently, or one retriever returns a different document generation.
+- **How the architecture detects it:** Compare index generation/version IDs, per-retriever freshness and hit rates, and source/version metadata during candidate fusion.
+- **How the system handles/recover from it:** Exclude stale generations; use only candidates whose ACL/version metadata validates; retry or rebuild the lexical index through the staged re-index process.
+- **Fallback behavior:** Use validated Qdrant dense results if their quality threshold passes; otherwise abstain or escalate rather than merging inconsistent sources.
+- **Impact on the user/system:** Temporary reduction in recall or latency while index synchronization is restored; no mixed-version evidence is presented.
+- **Monitoring/alerting required:** Track freshness lag and hit/error/latency metrics per retriever, fusion candidate source, and index generation; alert on drift or mismatch.
+
+### Scenario: MMR or contextual compression removes a material qualification
+
+- **Why it can happen:** Diversity selection suppresses related clauses, or compression omits an exception, waiting-period qualifier, amount, or table relationship.
+- **How the architecture detects it:** Evaluate reference-evidence recall before/after these stages; retain source chunk IDs/offsets and require citation/grounding checks for every material claim.
+- **How the system handles/recover from it:** Disable MMR/compression for the affected domain/query class; retrieve the original full chunk; reject summaries without source offsets or where required conditions do not fit.
+- **Fallback behavior:** Use the uncompressed validated chunk if it fits; otherwise ask a focused question or route to review.
+- **Impact on the user/system:** Additional latency or context use; prevents incomplete coverage guidance caused by optimization.
+- **Monitoring/alerting required:** Measure token reduction against evidence recall, citation correctness, qualifier retention, and answer quality by configuration.
+
+### Scenario: Offline evaluator or trace platform is unavailable or exposes sensitive data
+
+- **Why it can happen:** Ragas evaluator/model outage, LangSmith export failure, misconfigured sampling, or insufficient redaction/retention controls.
+- **How the architecture detects it:** Evaluation-job failures, export errors, data-loss-prevention alerts, privacy scanning, and trace access audits.
+- **How the system handles/recover from it:** Retry or pause offline evaluation without affecting serving; quarantine unapproved traces, disable export, and follow incident response for exposure.
+- **Fallback behavior:** Continue production with deterministic request-path controls and OTel/Azure telemetry; do not use unreviewed external traces.
+- **Impact on the user/system:** Delayed experiment/release evidence or reduced debugging detail; user responses remain independent of evaluators and trace SaaS.
+- **Monitoring/alerting required:** Alert on evaluation backlog/failures, trace export status, sensitive-data detections, access anomalies, and evaluator version drift.
 
 ### Scenario: Follow-up reference is ambiguous or rewritten query changes intent
 

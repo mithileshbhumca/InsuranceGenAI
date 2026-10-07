@@ -41,7 +41,7 @@ The deployment architecture must provide:
 - Azure Monitor
 - Application Insights
 - Azure API Management or equivalent ingress gateway
-- Managed Kafka / Event Hubs where needed
+- One managed event broker (Kafka or Event Hubs) where needed; do not deploy both by default
 - Azure SQL / PostgreSQL only if a relational store is required for specific workflows
 
 ### Why this stack is appropriate
@@ -145,6 +145,8 @@ This layer captures:
 - service health
 - AI usage and latency
 - ingestion job health
+- per-stage retrieval and generation quality signals, including index freshness, no-hit/low-confidence, citation failures, and escalation rate
+- offline evaluation artifacts and release comparisons, kept distinct from online service telemetry
 
 ### 4.5 Security layer
 
@@ -237,7 +239,12 @@ Used for:
 
 - vector storage
 - retrieval metadata payloads
-- similarity search
+- dense approximate-nearest-neighbor search (HNSW is the intended index family; actual collection settings are not yet specified)
+- metadata-filtered candidate retrieval
+
+Qdrant is a derived index, not the policy source of truth. Keep its document/version/chunk IDs reconcilable with immutable Blob sources and MongoDB lineage. HNSW construction/search parameters, quantization, payload indexes, shard/replica topology, corpus capacity, and recall/latency targets require workload benchmarking; they are not established by this architecture document.
+
+Alternatives such as Azure AI Search, pgvector, Weaviate, Milvus, or Pinecone should be compared only if managed-service fit, integrated lexical search, existing platform standard, transactional needs, or operational cost warrants it. Compare filter/ACL semantics, index freshness, backup/restore, tenant isolation, availability, p95 latency, and total cost before migration. No benchmark currently justifies replacing Qdrant.
 
 ### Redis
 Used for:
@@ -326,6 +333,10 @@ flowchart LR
 - OpenTelemetry instrumentation
 - centralized logs and traces
 - dashboards for API reliability and AI quality
+- Ragas evaluation jobs run offline or asynchronously; evaluator/model calls do not run as synchronous request gates
+- LangSmith is optional for LLM experiment/trace inspection and does not replace OTel/Azure production monitoring
+
+For LangSmith or any external trace service, apply approved data residency, retention, access, sampling, and redaction rules. Prefer opaque references over raw customer conversations, PII, or full retrieved passages. Telemetry export failure must not affect serving.
 
 ### Example dashboard categories
 
@@ -376,6 +387,30 @@ flowchart LR
 - stateless services where possible
 - decouple ingestion from user traffic
 - cache common retrieval outputs to reduce compute load
+- scale ingestion workers against broker lag and downstream provider quotas; partitioning/concurrency must preserve document-version publication gates
+- size Qdrant from chunk/vector count, dimensions, payload indexes, filter selectivity, concurrency, and replicas—not document count alone
+- thousands of source documents are an intended target, not a measured capacity claim; benchmark representative files, burst ingestion, re-index overlap, and recovery before committing throughput/latency SLOs
+
+```mermaid
+flowchart LR
+    UPLOAD[Approved upload] --> BLOB[(Immutable Blob source)]
+    BLOB --> EVENT[Chosen broker<br/>at-least-once delivery]
+    EVENT --> PART[Partition / bounded work queue]
+    PART --> W1[Ingestion worker]
+    PART --> W2[Ingestion worker]
+    PART --> WN[Ingestion worker pool]
+    W1 --> IDEM[Idempotent per-document stages]
+    W2 --> IDEM
+    WN --> IDEM
+    IDEM --> DI[Document Intelligence under quotas]
+    DI --> STAGE[Staged chunks, metadata and vectors]
+    STAGE --> CHECK[Cross-store/version validation]
+    CHECK -->|Pass| ACTIVE[Activate searchable generation]
+    CHECK -->|Fail| HOLD[Quarantine / repair]
+    PART -->|Poison event / retry exhausted| DLQ[Dead-letter queue and operator replay]
+```
+
+Airflow coordinates durable, observable workflow stages; it is not a substitute for broker delivery semantics or worker-level idempotency. A production deployment must define the concrete broker, partition key, consumer concurrency, Airflow executor/scheduler capacity, provider quotas, retry limits, and DLQ replay ownership.
 
 ---
 
@@ -576,6 +611,15 @@ Deployment recovery should preserve data integrity and security before availabil
 - **Fallback behavior:** Keep unaffected services and the last approved model/prompt configuration active; if safe behavior cannot be established, disable the affected workflow and direct users to human support.
 - **Impact on the user/system:** A temporary feature outage or degraded experience; rollback limits blast radius and prevents unsafe answers.
 - **Monitoring/alerting required:** Alert on rollout health gates, canary SLOs, rollback events, configuration drift, and AI quality/safety regressions.
+
+### Scenario: Evaluation or observability platform backlog/outage
+
+- **Why it can happen:** Ragas evaluation workers, telemetry ingestion, or optional LangSmith export are throttled, unavailable, misconfigured, or produce an unexpected data volume.
+- **How the architecture detects it:** Queue age, dropped spans, export errors, evaluator job status, DLP/redaction findings, and ingestion-rate/cost metrics.
+- **How the system handles/recover from it:** Buffer only within defined retention/capacity limits, sample or pause noncritical exports, retry background evaluation, and preserve essential OTel/Azure health metrics. Quarantine traces that fail privacy checks.
+- **Fallback behavior:** Continue application serving with deterministic request-path controls; do not block a user request on evaluation or observability SaaS availability.
+- **Impact on the user/system:** Reduced diagnostic detail or delayed release evidence; no direct response outage unless core Azure monitoring/security controls are themselves unavailable.
+- **Monitoring/alerting required:** Alert on telemetry loss, evaluation backlog, cost/volume spikes, export failures, privacy filter errors, and missed critical service alerts.
 
 ### Deployment recovery flow
 

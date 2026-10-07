@@ -112,10 +112,12 @@ Responsibilities:
 ### 4.3 Session and conversation service
 Responsibilities:
 
-- store session state
-- persist conversation context
+- store bounded conversation state and links to source turns/evidence
+- optionally persist durable conversation history in an approved store under retention and deletion policies
 - track user interaction history
 - maintain short-lived memory for multi-turn conversations
+
+Redis is an optional ephemeral session/cache layer with TTL and scoped keys, not the authoritative customer store or sole durable conversation record. MongoDB may hold conversation metadata/history only in separately governed collections if privacy, retention, deletion, and access requirements are approved. Customer profile, policy, claim, and eligibility facts must be fetched from enterprise systems of record on each authorized workflow; never derive them from LLM memory or old assistant messages.
 
 ### 4.4 Query router
 Responsibilities:
@@ -123,6 +125,7 @@ Responsibilities:
 - classify user intent
 - distinguish FAQ, policy lookup, claim status, coverage inquiry, recommendation, or escalation
 - choose whether to use retrieval, rules, or a human workflow
+- route deterministic/simple requests without unnecessary LLM calls; invoke conversation-aware rewriting for ambiguous follow-ups and capped multi-query only for complex decomposable questions
 
 ### 4.5 Agent orchestrator
 Responsibilities:
@@ -143,9 +146,11 @@ Responsibilities:
 
 - build search queries based on user intent and customer context
 - apply metadata filters (product, document type, region, policy version)
-- consult Qdrant for vector retrieval
-- optionally apply lexical retrieval or hybrid query logic
+- consult Qdrant for dense vector retrieval and, where deployed, a synchronized lexical/BM25 index
+- fuse and deduplicate candidates under identical access/version filters
+- optionally apply conservative MMR for duplicate-heavy candidate sets
 - call rerankers and then assemble evidence for the model
+- retain source IDs/offsets if optional extractive context compression is applied
 
 ### 4.8 Policy rule service
 Responsibilities:
@@ -161,6 +166,8 @@ Responsibilities:
 - handle prompt templates and structured output generation
 - track model version and cost usage
 - enforce guardrails and fallback logic
+- construct separate typed prompt blocks for system/security instructions, user request, customer facts, rule results, policy evidence, conversation context, and output contract
+- use a bounded token budget; history is continuity context only and cannot override authoritative sources
 
 ### 4.10 Guardrail and validation service
 Responsibilities:
@@ -174,9 +181,11 @@ Responsibilities:
 Responsibilities:
 
 - record user request details
-- log all retrieved evidence and policy decision inputs
+- record evidence IDs, source versions, rule versions, and decision provenance; retain raw prompt/evidence text only where an approved audit requirement explicitly requires it
 - save model outputs and citations
 - persist approval or escalation decisions
+
+Ordinary telemetry uses opaque references and redaction. Access to any separately retained content-bearing audit record must be least-privilege, purpose-limited, and governed by retention/deletion policy.
 
 ---
 
@@ -200,16 +209,35 @@ sequenceDiagram
     Auth-->>API: Authorized context
     API->>Router: Route request
     Router->>Orchestrator: Build workflow
-    Orchestrator->>Context: Fetch customer/policy context
-    Context-->>Orchestrator: Customer facts
-    Orchestrator->>Retrieval: Search policy docs
-    Retrieval-->>Orchestrator: Relevant chunks
-    Orchestrator->>Rules: Evaluate policy logic
-    Rules-->>Orchestrator: Coverage decision / constraints
-    Orchestrator->>LLM: Send combined context
-    LLM-->>Guard: Draft answer
-    Guard->>Guard: Safety + groundedness check
-    Guard-->>API: Final answer with citations
+    alt Self-contained policy FAQ
+        Orchestrator->>Retrieval: Search authorized current policy docs
+        Retrieval-->>Orchestrator: Relevant chunks / no-evidence status
+    else Customer coverage or eligibility request
+        par Authorized structured customer/policy lookup
+            Orchestrator->>Context: Fetch required system-of-record facts
+            Context-->>Orchestrator: Facts with source and freshness
+        and Policy evidence retrieval
+            Orchestrator->>Retrieval: Search using validated scope and filters
+            Retrieval-->>Orchestrator: Versioned evidence / no-evidence status
+        end
+        opt Deterministic rule evaluation is required
+            Orchestrator->>Rules: Evaluate with validated inputs
+            Rules-->>Orchestrator: Versioned outcome and reason codes
+        end
+    else Claim status request
+        Orchestrator->>Context: Read authorized claims system
+        Context-->>Orchestrator: Claim facts with source and freshness
+    end
+    Orchestrator->>Guard: Validate required evidence, provenance and response contract
+    Guard-->>Orchestrator: Pass, clarify, abstain or escalate
+    alt Safe to generate
+        Orchestrator->>LLM: Send combined context
+        LLM-->>Guard: Draft answer
+        Guard->>Guard: Safety + schema + citation validation
+        Guard-->>API: Validated answer with citations
+    else Missing evidence or failed validation
+        Guard-->>API: Clarification, abstention or human handoff
+    end
     API-->>User: Response
 ```
 
@@ -234,6 +262,9 @@ Use structured response models for:
 - guardrail status
 - retrieval metadata
 - workflow trace summary
+- distinct policy facts, customer facts with source/freshness, deterministic business-rule results with reason codes, and model-generated explanation/recommendation
+
+The API must not flatten these categories into an unattributed answer string. Policy facts cite approved document evidence; customer facts identify the authorized system of record and verification time; eligibility outcomes identify the governed rule/version. Recommendations/explanations are explicitly non-binding unless a separately approved workflow defines otherwise. Server-side validation resolves citation IDs and rejects unsupported material claims.
 
 ### Example response skeleton
 
@@ -276,6 +307,17 @@ Some backend workflows are not user-interactive and should run asynchronously.
 - Use async job queues or event-driven processing for these tasks
 - Keep synchronous user-facing workflows short and responsive
 - Do not block the user API while large ingestion or indexing tasks execute
+- Kafka/Event Hubs delivery and worker execution are treated as at-least-once; do not claim exactly-once side effects
+
+### Idempotency and replay boundaries
+
+- Derive a stable ingestion job key from tenant/source document ID/source checksum/version and pipeline generation; persist stage status before acknowledging completion.
+- Make extraction artifacts, chunk IDs, embedding writes, and metadata transitions idempotent for that key. Use staging generations and only publish after cross-store count/ID/version reconciliation.
+- On duplicate broker delivery, acknowledge a completed stage as a no-op; route conflicting checksums or non-retryable poison events to a dead-letter queue for review.
+- LangGraph node replay is not equivalent to idempotent LLM output. Keep model calls bounded by node/request deadlines and retry only transient provider errors. For side-effecting tools, pass an idempotency key and reconcile operation status before retry; never assume a model call has exactly-once semantics.
+- Keep retries capped with jitter, per-dependency timeouts, an overall request deadline, and circuit breakers for sustained failures. Cancel sibling parallel work when its result can no longer affect a response.
+
+The graph state should be a minimal, typed, request-scoped object with authorized scope, correlation/idempotency key, route, validated evidence references, rule result, deadline, and terminal outcome. Persistent checkpoint storage and retention are not specified; disable durable checkpoints until their security, privacy, and recovery requirements are approved.
 
 ---
 
@@ -336,6 +378,38 @@ Never assume a user can access all policy documents just because they are logged
 
 These should usually have additional validation and audit checks.
 
+### PII controls: Presidio and NeMo Guardrails
+
+These tools address different risks and are not substitutes:
+
+| Control | Primary role | Does not replace |
+|---|---|---|
+| Microsoft Presidio (or an approved equivalent DLP/PII service) | Detect and optionally anonymize identifiable text before an external model/trace boundary | Identity/authorization, business-purpose minimization, prompt-injection defense, policy grounding, or citation validation |
+| NeMo Guardrails | Dialogue/input/output policy checks and configured safety/behavior rails | Reliable PII discovery, access control, source-of-truth verification, deterministic rules, or schema/citation checks |
+
+For insurance data sent to a model or third-party trace service, first minimize fields and avoid sending data not needed for the task. Add a PII detection/masking control when the approved data classification requires it; Presidio is a candidate implementation, not an already selected/deployed component. Calibrate recognizers for policy identifiers and regional formats, measure false negatives/positives, and ensure masked prompts remain useful. If answer generation requires customer details, fetch and validate those through authorized systems and apply only approved, scoped restoration/rendering outside the model. Do not log raw text as a workaround.
+
+NeMo can complement that PII layer for prompt injection and dialogue policy. Neither tool is a security boundary by itself: enforce authZ before retrieval and validate structured output, provenance, citations, and customer data in deterministic application code.
+
+```mermaid
+flowchart LR
+    USER[Untrusted request] --> SCHEMA[API schema, size and rate validation]
+    SCHEMA --> AUTH[Authentication and authorization]
+    AUTH --> MIN[Minimize authorized context]
+    MIN --> PII[PII detect / mask when policy requires<br/>Presidio or approved DLP]
+    PII --> INJECT[Prompt-injection / policy screening<br/>NeMo and application controls]
+    INJECT --> RETRIEVE[Filtered retrieval and system-of-record calls]
+    RETRIEVE --> DOCSAFE[Label retrieved content as untrusted data<br/>screen embedded instructions]
+    DOCSAFE --> PROMPT[Typed, provenance-labelled prompt]
+    PROMPT --> LLM[LLM]
+    LLM --> NEMO[Output policy checks]
+    NEMO --> VALIDATE[Schema, evidence, citation and PII validation]
+    VALIDATE -->|Pass| RESP[Return validated response]
+    VALIDATE -->|Fail| SAFE[Reject, abstain or human review]
+```
+
+The deployment must define whether masked values are ever restored, which PII classes are in scope, and what is retained. Those policies and the Presidio deployment choice remain implementation gaps.
+
 ---
 
 ## 11. Observability and Telemetry
@@ -358,6 +432,10 @@ The backend must create rich operational telemetry.
 - structured logs with correlation IDs
 - trace IDs linking user request → orchestration → retrieval → answer
 - centralized dashboards and alerting in Azure Monitor / Application Insights
+- stage-level metrics for query rewrite, routing, dense/lexical search, fusion, optional MMR/compression, BGE, generation, guardrails, and citation validation
+- Ragas runs offline or asynchronously on privacy-reviewed samples; it never blocks a synchronous user response
+- LangSmith is optional for redacted LLM experiments/traces and does not replace OTel/Azure production telemetry
+- avoid raw conversation, PII, or full retrieved passages in ordinary logs; use opaque references, redaction, and governed trace access
 
 ---
 
@@ -374,11 +452,13 @@ The backend must create rich operational telemetry.
 
 ### Recommended strategies
 
-- retries with timeout and backoff
+- per-dependency deadlines and an overall request deadline; bounded retries with exponential backoff and jitter only for transient/idempotent operations
 - degraded mode for non-critical workflows
 - fallback safe responses when retrieval quality is poor
 - circuit breakers for dependencies
-- idempotent processing for ingestion and metadata jobs
+- idempotent processing for ingestion, metadata, and side-effecting tools; at-least-once queue redelivery is expected
+- cancel parallel work when the deadline expires; do not retry authorization denials, malformed requests, or deterministic validation failures
+- permit an approved alternate LLM only after separate quality, privacy, and operational qualification; otherwise abstain or hand off
 
 ### Important principle
 
@@ -592,6 +672,24 @@ The backend must treat authorization, customer context, policy evidence, and res
 - **Fallback behavior:** Return a clear throttled/retry-later response for interactive traffic; preserve document jobs durably for replay instead of holding requests open.
 - **Impact on the user/system:** Some requests are delayed or rejected under overload, while bounded work prevents cascading failure and duplicate indexing.
 - **Monitoring/alerting required:** Alert on saturation, queue depth/age, timeout cascades, retries, throttling, duplicate jobs, dead-letter volume, and worker restarts.
+
+### Scenario: Query rewriting or multi-query planning changes scope or exhausts the request budget
+
+- **Why it can happen:** A follow-up has multiple plausible antecedents, rewrite/model timeout, query expansion produces too many searches, or concurrent subqueries overload retrieval services.
+- **How the architecture detects it:** Validate rewrite confidence and scope against the original query; enforce subquery, token, deadline, and concurrency budgets; monitor per-stage latency and retrieval-call count.
+- **How the system handles/recover from it:** Use direct retrieval for self-contained questions; for uncertain rewrite ask clarification; cap complex multi-query fan-out and cancel unfinished work when the request deadline expires.
+- **Fallback behavior:** Use the unchanged original query only when it is self-contained; otherwise return clarification/unavailable rather than guessing or widening access.
+- **Impact on the user/system:** A clarification or slightly slower complex request; prevents wrong-domain searches and runaway fan-out.
+- **Monitoring/alerting required:** Track rewrite failures/confidence, intent-preservation review, subqueries per request, cancellation, fan-out cost, and p95 latency by route.
+
+### Scenario: Offline evaluation or optional trace export fails
+
+- **Why it can happen:** Ragas/evaluator dependency failure, LangSmith export outage, quota exhaustion, or privacy redaction failure.
+- **How the architecture detects it:** Evaluation job status, export errors, DLP/redaction findings, and trace-access audit events.
+- **How the system handles/recover from it:** Retry or pause background evaluation/export; quarantine unsafe traces; preserve local versioned evaluation artifacts and Azure operational traces.
+- **Fallback behavior:** Continue serving through deterministic validation and OTel/Azure monitoring; evaluator and trace-platform availability never gates user requests.
+- **Impact on the user/system:** Delayed experiment insights, with no user-path outage.
+- **Monitoring/alerting required:** Alert on evaluator backlog/failure, export and redaction errors, unexpected trace content, and unapproved access.
 
 ### Backend dependency recovery flow
 

@@ -149,14 +149,14 @@ User
 - Query Understanding: intent detection, classification, and routing
 - Agent Orchestrator: coordinates retrieval, reasoning, policy rules, and final response generation
 - Customer Context Service: retrieves policy, customer, and claims context from authoritative systems
-- Retrieval Service: semantic search with metadata constraints
-- Re-ranker: improves retrieval precision using cross-encoder or LLM-based ranking
+- Retrieval Service: Qdrant dense search with trusted metadata constraints and synchronized lexical/BM25 retrieval only where deployed
+- Re-ranker: BGE cross-encoder reranking of a bounded candidate set
 - Policy / Rule Engine: applies business logic, exclusions, and policy interpretation requirements
 - LLM Orchestration Layer: models, prompts, tool use, and structured output handling
 - Guardrail Layer: checks for unsafe, inappropriate, or compliance-risk behavior
 - Validation Layer: ensures answers are grounded in evidence and consistent with policy logic
 - Citation Layer: ensures each answer maps to document and chunk source references
-- Audit Service: stores prompts, retrieval context, answer traces, and escalation records
+- Audit Service: records correlation IDs, source/version/evidence references, decision provenance, and escalation records; content-bearing traces require explicit retention and access approval
 
 ---
 
@@ -179,6 +179,17 @@ User
 - Qdrant: embeddings, payload metadata, retrieval context, and vector search indexes
 - Redis: retrieval caching, session state, hot context caching, rate limiting, and distributed locks where useful
 - optional relational DB: only if strong transactional or reporting requirements appear; not mandatory for early production
+- Redis may hold short-lived, scoped session/cache state; MongoDB may hold durable conversation history only if retention, privacy, deletion, and access requirements approve it
+
+### Structured and unstructured sources of truth
+
+| Data | Type | Authoritative source | Architecture use |
+|---|---|---|---|
+| Approved policy documents, procedures, brochures | Unstructured | Approved source repository; immutable copy in Blob Storage | Extraction, indexing, retrieval and citations; Blob retains the source artifact |
+| Customer profile, policy lifecycle, claims and eligibility inputs | Structured | CRM, policy administration, claims and governed rules services | Fetched for each authorized workflow; MongoDB, Qdrant and Redis are not authoritative for these facts |
+| Extracted text, chunks, document versions and processing status | Derived structured metadata | MongoDB lineage/metadata records tied to immutable source versions | Processing control, filters and citation resolution; reconstructable from source plus versioned pipeline |
+| Embeddings and retrieval payloads | Derived index | Qdrant | Approximate-nearest-neighbor retrieval; not a policy or document source of truth |
+| Session cache, hot results, rate limits | Ephemeral state | Redis with TTL and invalidation | Optimization only; cache miss/failure falls back to authorized lookup or safe interruption |
 
 ### Design patterns
 
@@ -187,6 +198,8 @@ User
 - embeddings stored in Qdrant keyed to chunk IDs and document versions
 - traceability retained from source document → chunk → embedding → answer → citation
 - access logs and answer traces captured for every customer-facing interaction
+- customer profile, policy, claims, and eligibility facts remain in authoritative enterprise systems; do not persist them as LLM long-term memory
+- MongoDB and Qdrant are derived application stores; reconcile document version/checksum and index state before a document becomes searchable
 
 ---
 
@@ -197,13 +210,13 @@ User
 1. parse and classify the query
 2. determine the user’s data access permissions and customer context scope
 3. retrieve relevant customer and policy metadata
-4. query the vector index using semantic search with metadata filters
-5. optionally use lexical retrieval or hybrid retrieval for exact policy terminology
-6. re-rank top results using cross-encoder scoring
-7. filter to high-confidence, role-compatible, and current-version documents
-8. pass retrieved evidence to the LLM as constrained context
-9. require answer grounding against evidence before final output summary
-10. enforce source citations and answer validation before returning to the user
+4. use direct retrieval for self-contained queries; rewrite only ambiguous follow-ups and decompose only complex multi-facet queries
+5. retrieve using Qdrant dense search plus lexical/BM25 where deployed, with identical ACL, policy, jurisdiction, and version filters
+6. fuse and deduplicate candidates; optionally use conservative MMR only when duplicate-heavy retrieval is measured
+7. retain BGE cross-encoder reranking; optionally apply extractive compression to long passages after reranking while preserving source offsets
+8. filter to high-confidence, role-compatible, current-version documents
+9. assemble separate customer facts, business-rule results, policy evidence, relevant history, and system instructions within a bounded token budget
+10. generate structured, grounded content; server-validate evidence IDs, citations, source versions, and response schema before returning to the user
 
 ### Why this is appropriate
 
@@ -218,27 +231,61 @@ User
 - use chunk-level provenance and source citations
 - use metadata filters rather than broad vector-only retrieval
 - track document version awareness so stale policy answers are avoided
+- use hybrid lexical + dense retrieval for insurance terms when a synchronized lexical index is deployed
+- run Ragas metrics offline against SME-reviewed evidence; keep deterministic checks online
+
+### Context authority and answer types
+
+Conversation history is used only for continuity and reference resolution. It cannot override current authorization, customer/policy systems of record, approved policy documents, or governed rules. Keep these prompt blocks separate and provenance-labelled: **system/security instructions**, **current user request**, **customer facts**, **business-rule results**, **retrieved policy evidence**, **relevant conversation history**, and **output contract**. Conflicts between authoritative inputs require clarification or human review.
+
+The response contract distinguishes retrieved policy facts, customer-specific facts, business-rule outcomes, and model-generated explanations/recommendations. Recommendations or explanations must not be represented as contractual coverage or eligibility determinations.
 
 ---
 
-## 10. Multi-Agent Architecture
+## 10. Multi-Agent and Workflow Architecture
 
-A single monolithic LLM agent is not ideal for regulated enterprise scenarios. A supervisor + specialist pattern is preferred.
+Use LangGraph as a controlled workflow/state machine, not as a mandate to create an autonomous agent for every component. Prefer typed, deterministic services/tools for authorization, customer context, retrieval, and eligibility rules; use LLM nodes only where language interpretation or constrained explanation adds measurable value.
 
-### Recommended specialist agents
+### Recommended workflow nodes and boundaries
 
-- Router Agent: classifies each request into workflow type such as FAQ, policy lookup, claim eligibility, recommendation, or escalation
-- Retrieval Agent: handles search, metadata filtering, and reranking
-- Policy Reasoning Agent: interprets policy language and applies business rules
-- Customer Context Agent: retrieves relevant policy, customer, and claims information
-- Safety / Guardrail Agent: validates privacy and policy safety boundaries
-- Validation Agent: checks groundedness, citations, and final answer consistency
+- Query understanding/domain routing: deterministic rules or a small classifier first; invoke a model only for uncertain intent or conversation-aware rewriting.
+- Customer context: authorized calls to CRM, policy, and claims systems of record; never an LLM memory lookup.
+- Retrieval: constrained tool for metadata-filtered hybrid retrieval, BGE reranking, and evidence provenance.
+- Policy reasoning: optional constrained synthesis of source clauses; abstain/escalate on conflict or legal ambiguity.
+- Eligibility: versioned deterministic rules/service with reason codes, not an autonomous eligibility agent.
+- Recommendation: optional governed workflow using approved suitability inputs and rules; disclose limitations and escalate where required.
+- Response generation: one structured LLM generation step; avoid a separate response-generation agent.
+- Guardrails/validation: NeMo plus deterministic authorization, schema, grounding, and citation validators; avoid relying on a model judge as the only control.
 
-### Preferred implementation model
+This keeps agent count low, limits serial model calls, and makes each decision auditable. Add an autonomous specialist only after a measurable use case cannot be represented safely as a deterministic graph node or service.
 
-- use LangGraph for supervisor-driven stateful orchestration when explicit workflow control is needed
-- use simpler orchestration if the organization prefers a lower-complexity FastAPI + service-based design
-- avoid excessive agent sprawl; use disciplined orchestration, not complexity for its own sake
+### Conditional execution and shared state
+
+After authorization establishes tenant/customer scope, independent customer-context reads and policy retrieval may run in parallel. Rule evaluation joins only when its required inputs are available; response generation follows evidence, rule, and provenance validation. LangGraph state is request-scoped typed workflow data (correlation ID, authorized scope, route, evidence IDs, rule results, deadlines, and outcome), not shared mutable global memory. Durable checkpointing, its store, and retention are not specified and require a security/privacy decision before enabling.
+
+```mermaid
+flowchart TD
+    START[Request] --> AUTH[Authenticate and authorize]
+    AUTH --> ROUTE{Intent and required inputs}
+    ROUTE -- Self-contained FAQ --> RETRIEVE[Policy retrieval]
+    ROUTE -- Follow-up --> REWRITE[Resolve from bounded authorized history]
+    REWRITE --> RETRIEVE
+    ROUTE -- Claim status --> CLAIMS[Claims system lookup]
+    ROUTE -- Coverage / eligibility --> SCOPE[Resolve authorized customer and policy scope]
+    SCOPE --> FANOUT{Independent authorized reads}
+    FANOUT --> CUSTOMER[Customer / policy context]
+    FANOUT --> RETRIEVE
+    CUSTOMER --> JOIN[Join validated inputs]
+    RETRIEVE --> JOIN
+    CLAIMS --> JOIN
+    JOIN --> RULES[Deterministic governed rules when required]
+    RULES --> VALIDATE[Evidence, provenance and schema validation]
+    JOIN --> VALIDATE
+    VALIDATE -->|Pass| GENERATE[One structured generation step]
+    VALIDATE -->|Fail / conflict| SAFE[Clarify, abstain or human review]
+    GENERATE --> GUARD[Guardrails and server validation]
+    GUARD --> OUT[Validated response]
+```
 
 ---
 
@@ -263,19 +310,26 @@ Admin
 
 ### Why Azure AI Document Intelligence is important
 
-- superior for scanned PDFs and layout-heavy documents
-- strong for forms, tables, and semi-structured insurance records
-- good fit for policy docs, claims manuals, and legacy PDF formats
-- better than naïve extraction for complex insurance artifacts
+- selected for OCR and layout-aware extraction of scanned PDFs, forms, tables, and semi-structured insurance records
+- preserves structural information needed for clause-aware chunking and page-level citations better than plain text-only extraction
+- extraction quality still depends on source quality and configured model/input support; quality gates and quarantine are required
 
 ### Ingestion best practices
 
 - use chunking strategies tuned for insurance policy language: clause-based, section-based, table-aware, concise retrieval chunks
+- preserve document headings, clause boundaries, table structure, page offsets, and source provenance during structure-aware chunking
 - enrich each chunk with metadata: product type, coverage line, region, document version, effective date, jurisdiction, language, and document owner
 - preserve provenance for each chunk to source document and version
-- include quality gates before embedding and indexing
+- validate extraction quality, required metadata, chunk-size distribution, duplicates, and citation anchors before embedding and indexing; quarantine failures
+- version the parser, chunker, embedding model/dimensions, and index schema; stage and validate re-indexes before publishing a new active version
 - reprocess documents on version change while retaining prior version history
 - handle OCR errors and extraction exceptions explicitly
+- process independent document jobs and safe per-document stages concurrently under broker/worker and provider quotas; treat broker delivery as at-least-once and use stable job identity plus idempotent writes rather than assuming exactly-once execution
+- choose one broker (managed Kafka or Event Hubs) based on platform fit; Airflow orchestrates durable stages and bounded retries, while worker concurrency/partitioning handles event throughput
+
+Azure AI Document Intelligence remains the extraction layer for scanned text, tables, forms, and complex layouts. A multimodal LLM is not a default replacement or addition; consider it only for a defined image/chart/diagram interpretation workflow that Document Intelligence cannot support.
+
+Thousands of documents are an intended moderate-scale corpus, not a demonstrated capacity guarantee. The architecture has no benchmark for ingestion throughput, worker concurrency, extraction quotas, Qdrant/MongoDB write rates, re-index overlap, or restore time. Validate those with representative sizes/formats before committing an SLO.
 
 ---
 
@@ -326,7 +380,7 @@ Admin
 - Azure Monitor
 - Application Insights
 - Azure API Management or equivalent ingress layer
-- managed Kafka or Event Hubs where needed
+- one managed Kafka or Event Hubs broker where needed; choose one, do not deploy both by default
 - CI/CD via GitHub Actions or Azure DevOps
 
 ### Why this stack is appropriate
@@ -350,7 +404,7 @@ Admin
 
 - OAuth2 / OIDC authentication for users and services
 - RBAC / ABAC for permission checks by role and context
-- PII detection and masking before LLM calls when needed
+- data minimization and PII detection/masking before model or trace export when required by data classification (Presidio is a candidate, not a selected component)
 - retrieval filtering based on user permissions and policy scope
 - encryption in transit and at rest
 - private networking and private endpoints where possible
@@ -359,10 +413,13 @@ Admin
 - careful retention and deletion policies
 - secure configuration and prompt handling
 - rate limiting and abuse protection
+- scope conversation-history reads to the authenticated tenant, user, and conversation; treat prior turns and summaries as untrusted continuity context, never as policy/customer truth
+- derive ACL and policy-version metadata from trusted ingestion/customer systems; do not let an LLM infer or widen access filters
 
 ### AI-specific security risks to address
 
 - prompt injection from user input or retrieved documents
+- prompt injection or sensitive-data reuse through stored conversation turns and summaries
 - retrieval poisoning via tampered source documents
 - data leakage across tenants or roles
 - unsupported extraction of customer or policy info
@@ -373,6 +430,7 @@ Admin
 - input validation and sanitization
 - prompt injection detection
 - retrieval filtering and role-based access checks
+- server-side evidence authorization, version, provenance, and citation validation
 - answer grounding and evidence validation
 - output safety filters
 - human escalation for high-risk decision paths
@@ -389,6 +447,8 @@ Admin
 - rerank performance
 - guardrail triggers and safety events
 - answer groundedness and citation success
+- per-stage latency and failure: rewrite, routing, dense/lexical search, fusion, reranking, optional MMR/compression, generation, and validation
+- no-hit/low-confidence, clarification, abstention, escalation, cache-scope, and index-freshness rates
 - ingestion pipeline health and job failures
 - operational alerts for key business workflows
 
@@ -396,8 +456,15 @@ Admin
 
 - OpenTelemetry for instrumentation
 - Azure Monitor and Application Insights for logs, metrics, and tracing
-- LangSmith only when deep model experimentation is necessary
+- Ragas for offline, versioned RAG evaluation using SME-reviewed Faithfulness, Answer Relevancy, Context Precision, and Context Recall datasets
+- LangSmith optional for LLM-specific experiment/trace UX after privacy and vendor review; it does not replace OTel/Azure production telemetry
 - centralized structured logging across user and ingestion workflows
+
+### Offline evaluation vs online monitoring
+
+- **Offline evaluation:** Run curated, versioned question/evidence sets through Ragas during retrieval, prompt, model, parser, chunker, and embedding changes. Calibrate judge metrics with insurance SMEs and keep deterministic citation/access checks alongside them.
+- **Online monitoring:** Keep request-path controls deterministic: authorization, current-version checks, output schema, citation resolution, and hard time/token limits. Use OTel/Azure Monitor for production health and quality signals; optionally run judge-based quality scoring asynchronously on a privacy-reviewed sample. Evaluation/trace-tool outages must not block user responses.
+- **LangSmith:** Optional experimentation and trace inspection only, with redacted/minimized data and approved retention/residency. Never make production responses depend on telemetry export.
 
 ### Why it matters
 
@@ -555,9 +622,10 @@ Use gold-standard question sets with:
 
 - LangGraph: useful for explicit multi-agent orchestration and workflow state
 - LangChain: helpful for abstraction, but avoid unnecessary complexity if direct SDKs are sufficient
-- LangSmith: useful for experimentation and tracing when needed
+- LangSmith: optional for redacted LLM experiments/traces; OTel/Azure remains the production operations source of truth
 - BGE cross-encoder: recommended for reranking quality
-- NeMo Guardrails: useful if the organization wants a policy-first guardrail framework; otherwise, implement guardrails in the app and orchestration layer
+- NeMo Guardrails: retain as the documented dialogue/input-output guardrail layer, backed by mandatory deterministic application controls for authorization, PII, schema, grounding and citation validation
+- Microsoft Presidio: candidate PII detection/anonymization implementation if required by the data-classification policy; not currently selected/deployed and not a replacement for NeMo or access controls
 
 ### Avoid unless justified
 
@@ -676,12 +744,16 @@ This parent README is the top-level reference. Supporting design documents are l
 - [rag-architecture.md](./rag-architecture.md)
 - [deployment-architecture.md](./deployment-architecture.md)
 - [backend-architecture.md](./backend-architecture.md)
+- [24-rag-enhancement-decisions.md](./docs/architecture/24-rag-enhancement-decisions.md)
+- [25-architecture-interview-readiness.md](./docs/architecture/25-architecture-interview-readiness.md)
 
 ### Detailed document coverage
 
 - [rag-architecture.md](./rag-architecture.md): retrieval, reranking, chunking, citation strategy, and RAG evaluation
 - [deployment-architecture.md](./deployment-architecture.md): cloud deployment, AKS, storage, monitoring, and production operations
 - [backend-architecture.md](./backend-architecture.md): service responsibilities, FastAPI backend design, and dependency model
+- [24-rag-enhancement-decisions.md](./docs/architecture/24-rag-enhancement-decisions.md): item-by-item evaluation, trade-offs, final retrieval strategy, and Principal Architect review
+- [25-architecture-interview-readiness.md](./docs/architecture/25-architecture-interview-readiness.md): concise interview answers, architecture diagrams, explicit gaps, and Principal Architect review
 
 ---
 
