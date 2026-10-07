@@ -59,7 +59,7 @@ flowchart LR
 flowchart TD
     DOC[Approved PDF or allowed input] --> BLOB[(Immutable Blob source)]
     BLOB --> EVT[Document event]
-    EVT --> BROKER[One chosen broker<br/>Kafka or Event Hubs]
+    EVT --> BROKER[Managed Kafka broker]
     BROKER --> AIRFLOW[Airflow durable workflow]
     AIRFLOW --> DI[Document Intelligence<br/>OCR / layout / tables]
     DI --> QUALITY{Extraction and metadata gates}
@@ -82,7 +82,7 @@ flowchart TD
 
 **Why:** Upload bursts and policy updates should not block online queries, and a partially indexed or superseded policy must not become active.
 
-**How:** A single chosen Kafka or Event Hubs broker decouples arrivals; Airflow coordinates durable pipeline stages; bounded worker concurrency processes independent document jobs subject to Document Intelligence/model quotas. Treat events as at-least-once. Derive stable idempotency keys from source identity, checksum, version and pipeline generation; make extraction/chunk/embedding/metadata writes repeatable. Publish only after MongoDB/Qdrant reconciliation. Store effective dates and select evidence valid for the request date/jurisdiction.
+**How:** One managed Kafka broker decouples arrivals; Airflow coordinates durable pipeline stages; bounded Kafka consumers/workers process independent document jobs subject to Document Intelligence/model quotas. Partition by stable document/job key; treat events as at-least-once. Derive idempotency keys from source identity, checksum, version and pipeline generation; persist stage state before ack; make extraction/chunk/embedding/metadata writes repeatable. Publish only after MongoDB/Qdrant reconciliation. Store effective dates and select evidence valid for the request date/jurisdiction.
 
 For references across clauses/documents, preserve the reference text and page/section anchors. Follow a reference only when the target is resolved to an approved version and passes the same ACL/effective-date filters. Cite each retrieved target independently. Automated cross-document reference resolution is **not yet specified**.
 
@@ -156,7 +156,7 @@ flowchart TD
 
 **How:** Set per-dependency timeouts plus an overall request deadline, capped exponential backoff with jitter, admission control/backpressure, and circuit breakers. Retry transient provider errors only within budget; do not retry authorization denials, invalid inputs, or deterministic validation failures. A fallback model is allowed only after privacy, quality, and operational qualification. Otherwise return retry-later, clarification, abstention or human handoff.
 
-Use at-least-once Kafka/Event Hubs semantics with stable job keys and idempotent ingestion stages. On graph replay, pass idempotency keys to side-effecting tools and reconcile operation status before retry. A generation retry may vary and incur another charge; preserve attempt/trace IDs and never treat it as exactly-once.
+Use at-least-once Kafka semantics with stable job keys and idempotent ingestion stages. On graph replay, pass idempotency keys to side-effecting tools and reconcile operation status before retry. A generation retry may vary and incur another charge; preserve attempt/trace IDs and never treat it as exactly-once.
 
 **Trade-offs:** Resilience controls improve safety and availability but require timeout budgets, DLQ operations, idempotency ledgers/keys, and tested replay/restore procedures.
 
@@ -168,7 +168,7 @@ Use at-least-once Kafka/Event Hubs semantics with stable job keys and idempotent
 
 **Why:** Insurance prompts and retrieved documents can contain sensitive identifiers and untrusted instructions. Guardrails do not establish authorization or policy truth.
 
-**How:** Authenticate and authorize before customer/history retrieval. Treat user text, retrieved documents and conversation summaries as untrusted data, not instructions. Minimize fields before model calls. Microsoft Presidio (or an approved DLP/PII service) detects and may mask text; NeMo Guardrails checks dialogue/input/output policy and configured safety rails. Retain NeMo as the documented baseline. Use both when the data-classification policy requires PII detection/masking; Presidio is a candidate, not the only acceptable implementation. They are complementary, not interchangeable. The documentation does not prove either tool's production configuration or effectiveness.
+**How:** Authenticate and authorize before customer/history retrieval. Treat user text, retrieved documents and conversation summaries as untrusted data, not instructions. Minimize fields before model calls. When classified PII may cross an external model/trace boundary, use Microsoft Presidio as the reference detection/masking implementation or an approved equivalent DLP service; redact trace/output separately. NeMo Guardrails checks dialogue/input/output policy and configured safety rails. They are complementary, not interchangeable. Do not restore masked identifiers in model context; fail closed if the required detector is unavailable. The documentation does not prove production configuration or effectiveness.
 
 Validate output schema, evidence IDs, citation source/version/authorization, required disclosures, and customer/rule provenance in application code. Do not log raw conversations or retrieved passages by default. Define trace and audit access, retention, deletion, residency and redaction rules.
 
@@ -176,7 +176,7 @@ Validate output schema, evidence IDs, citation source/version/authorization, req
 
 **Failure handling:** If auth, masking required by policy, or citation validation is unavailable, fail closed for sensitive outputs. If a prompt/document injection signal is uncertain, ignore the embedded instruction and continue only with safe evidence, or abstain/review. Security tooling outages must not cause a bypass.
 
-**Gap:** PII classes, regional recognizers, masking/restoration behavior, Presidio/DLP selection, prompt-injection evaluation corpus and security-specific latency budgets are not specified.
+**Gap:** The target control is defined, but PII classes, approved model/trace destinations, recognizer configuration and regional tests, trace retention/deletion, and actual Presidio/DLP deployment remain release gates. Prompt-injection evaluation coverage and measured security-control latency are also not evidenced.
 
 ## 8. Agent Quality, Evaluation and Improvement
 
@@ -226,25 +226,25 @@ flowchart LR
 - Keep Azure AI Document Intelligence for OCR/layout/table extraction and structure-aware chunking. Do not equate it with general image/chart understanding.
 - Keep Qdrant and BGE as documented choices; hybrid lexical retrieval remains conditional on a synchronized, ACL-equivalent lexical index. HNSW settings and capacity claims must await benchmark evidence.
 - Describe LangGraph as a conditional, typed workflow with selected LLM nodes—not a set of autonomous agents. Use deterministic services for customer access and eligibility.
-- Presidio and NeMo address different layers. The architecture should select an approved PII detector/DLP only after data classification; NeMo is not a substitute.
+- Presidio is the reference PII detector/masking implementation when classified PII may cross external boundaries; an approved enterprise DLP equivalent is acceptable. NeMo is complementary and is not a PII or authorization control.
 - Use Ragas offline for the named metrics and optional privacy-reviewed LangSmith for experiment UX; keep OTel/Azure monitoring operational. Feed confirmed failures into regression tests with human approval.
 
 ### Gaps and contradictions to resolve before production
 
 1. **Format contract:** Exact supported MIME types, file/page/size limits, encrypted-file handling, languages, OCR confidence thresholds, and image/table acceptance tests are unspecified.
-2. **Capacity and SLOs:** No load benchmark for thousands of files, chunk/vector count, ingestion parallelism, retrieval p95, extraction/model quotas, re-index overlap, or cost per successful task.
-3. **Broker/orchestrator topology:** Kafka and Event Hubs are alternatives but deployment must select one. Define partition key, consumer concurrency, Airflow executor, retries, DLQ ownership and replay controls.
-4. **Qdrant production settings:** HNSW, payload indexes, quantization, shard/replica counts, backup frequency, RPO/RTO, failover and restore drills are not configured/documented as measured values.
+2. **Capacity and SLOs:** No workload model or load benchmark for route mix, peak concurrency/RPS, thousands of files, chunk/vector count, ingestion parallelism, retrieval p95/p99, extraction/model quotas, re-index overlap, or cost per successful task. Customer count alone is not capacity.
+3. **Broker/orchestrator topology:** The target architecture selects one managed Kafka broker, with Airflow coordinating stages and bounded Kafka consumers doing parallel work. The managed Kafka offering, partition/retention configuration, consumer concurrency, Airflow executor, quotas, retry budget, DLQ owner and replay runbook still require deployment configuration and load-test evidence.
+4. **Qdrant production settings and recovery:** HNSW, payload indexes, quantization, shard/replica counts, backup frequency, business-approved RPO/RTO, failover and restore drills are not configured/documented as measured values. Restore and cross-store reconciliation must pass before retrieval is re-enabled.
 5. **Cross-document references:** Source offsets/citations exist, but automated link/reference extraction, target resolution and completeness evaluation are not specified.
 6. **Graph state:** Typed request-scoped state is a design recommendation; checkpoint storage, encryption, retention, replay and deletion are unselected.
-7. **PII controls:** Generic masking is documented; Presidio is not deployed. Select recognizers/DLP, thresholds, masking/restoration, false-negative testing and regional policy before external model/trace use.
+7. **PII controls:** Presidio is the reference detector/masking implementation when classified PII may cross an external boundary; an approved DLP equivalent is acceptable. Selection/configuration, recognizers, false-negative testing, trace redaction/retention and deployment evidence remain outstanding before external model/trace use.
 8. **Feedback product surface:** The human-reviewed loop is an operating design; feedback capture, consent, case triage ownership and SLA are not specified.
-9. **Quality gates:** Define per-intent/product/jurisdiction regression thresholds and release ownership. Aggregate Ragas scores alone are insufficient for insurance exclusions and eligibility.
+9. **Quality gates:** The RAG design now defines required stratification, deterministic hard gates and SME approval of per-segment thresholds. The actual gold set, numeric thresholds, owners and passing test evidence remain release requirements; aggregate Ragas scores alone are insufficient for exclusions and eligibility.
 10. **Framework verification:** NeMo is the documented guardrail baseline, but its runtime configuration, test coverage and operational ownership are not evidenced here. Verify deployment and controls. LangSmith remains optional and is never the production telemetry authority.
 
 ### Unnecessary or conditional technologies
 
-- Do not run both Kafka and Event Hubs without a specific integration requirement.
+- Do not add Event Hubs as a second broker for the document-ingestion flow; maintain the single Kafka event path.
 - Do not add multiple specialist autonomous agents, always-on multi-query, MMR, compression, a VLM, or long-term sensitive customer memory by default.
 - Do not make both MongoDB and Redis durable conversation authorities. Redis is ephemeral; MongoDB persistence requires governance approval.
 - Do not add a relational store, LangChain, or a separate lexical index without a demonstrated requirement and operational owner.

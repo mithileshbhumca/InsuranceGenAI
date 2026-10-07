@@ -82,8 +82,7 @@ The system must support:
 
 ## 4. Non-Functional Requirements
 
-- availability: 99.9%+ for customer-facing APIs
-- latency: p95 under 3-5 seconds for standard Q&A; complex workflows may require asynchronous handling
+- availability and latency: service-level objectives are to be agreed per workflow and verified under representative load before production; no numeric target or capacity is established by this architecture
 - security: end-to-end encryption, least privilege, and strict controls for PII and customer data
 - scalability: support for high concurrency and growing document corpora
 - reliability: retries, idempotent ingestion, and safe fallback behavior
@@ -91,6 +90,10 @@ The system must support:
 - explainability: every answer must be grounded in authoritative sources
 - compliance: role-based access, retention, audit logging, and governance controls
 - maintainability: modular architecture, explicit contracts, and clear ownership boundaries
+
+### Capacity qualification
+
+The target population of 20,000–40,000 customers is not a concurrency or capacity claim. Before production, product and platform owners must define peak/burst request rates and concurrent sessions by workflow (simple Q&A, follow-up/personalized Q&A, and recommendations), response-time objectives, ingestion/re-index workload, model/provider quotas, and cost limits. Load and dependency-failure tests must cover the complete request path and demonstrate agreed headroom. Do not treat customer count or an untested estimate as a service-level commitment.
 
 ---
 
@@ -240,6 +243,8 @@ Conversation history is used only for continuity and reference resolution. It ca
 
 The response contract distinguishes retrieved policy facts, customer-specific facts, business-rule outcomes, and model-generated explanations/recommendations. Recommendations or explanations must not be represented as contractual coverage or eligibility determinations.
 
+The dedicated `POST /api/v1/recommendations` design is not evidence of a deployed endpoint. Keep it disabled until customer/policy/claims (as permitted), catalog, and deterministic rules integrations, data freshness, authorization/purpose, ranking ownership, disclosures, audit/error contracts, and failure tests are approved; see the [RAG architecture](./rag-architecture.md).
+
 ---
 
 ## 10. Multi-Agent and Workflow Architecture
@@ -297,7 +302,7 @@ Admin
 → Document Upload / Portal
 → Object Storage
 → Event Notification
-→ Event Broker (Kafka or managed Event Hubs)
+→ Managed Kafka broker (single ingestion event path)
 → Airflow Orchestration
 → Azure AI Document Intelligence
 → Document Normalization
@@ -325,7 +330,7 @@ Admin
 - reprocess documents on version change while retaining prior version history
 - handle OCR errors and extraction exceptions explicitly
 - process independent document jobs and safe per-document stages concurrently under broker/worker and provider quotas; treat broker delivery as at-least-once and use stable job identity plus idempotent writes rather than assuming exactly-once execution
-- choose one broker (managed Kafka or Event Hubs) based on platform fit; Airflow orchestrates durable stages and bounded retries, while worker concurrency/partitioning handles event throughput
+- use one managed Kafka broker for document-ingestion events; Airflow coordinates stages and bounded retries, while Kafka consumers/workers provide partitioned parallelism and idempotent processing
 
 Azure AI Document Intelligence remains the extraction layer for scanned text, tables, forms, and complex layouts. A multimodal LLM is not a default replacement or addition; consider it only for a defined image/chart/diagram interpretation workflow that Document Intelligence cannot support.
 
@@ -380,7 +385,7 @@ Thousands of documents are an intended moderate-scale corpus, not a demonstrated
 - Azure Monitor
 - Application Insights
 - Azure API Management or equivalent ingress layer
-- one managed Kafka or Event Hubs broker where needed; choose one, do not deploy both by default
+- one managed Kafka broker for document-ingestion events; do not add Event Hubs as a second broker for the same flow
 - CI/CD via GitHub Actions or Azure DevOps
 
 ### Why this stack is appropriate
@@ -404,7 +409,7 @@ Thousands of documents are an intended moderate-scale corpus, not a demonstrated
 
 - OAuth2 / OIDC authentication for users and services
 - RBAC / ABAC for permission checks by role and context
-- data minimization and PII detection/masking before model or trace export when required by data classification (Presidio is a candidate, not a selected component)
+- data minimization before model or trace export; when classified PII may cross an external boundary, require Presidio or an approved equivalent DLP control, with masking, redaction, and outage behavior verified before release
 - retrieval filtering based on user permissions and policy scope
 - encryption in transit and at rest
 - private networking and private endpoints where possible
@@ -508,7 +513,7 @@ Insurance AI workloads are not just UX features. They are business-critical and 
 - horizontal scaling of API and orchestration services
 - queue-based asynchronous ingestion and heavy processing
 - metadata filtering to reduce retrieval cost
-- Redis hot cache and short-lived state
+- Redis optional scoped cache and short-lived state (non-authoritative; personalized outputs uncached by default)
 - autoscaling around queue depth and API load
 - query-time pruning of low-value documents
 
@@ -595,11 +600,14 @@ Use gold-standard question sets with:
 
 - use smaller models for routing and guardrails
 - use premium models only for final reasoning and answer synthesis where needed
-- cache frequent retrieval results and common FAQ answers
+- cache measured, immutable public/role-scoped retrieval results or common FAQ evidence only; do not cache customer facts, eligibility, or personalized responses by default
 - add quality gates to avoid repeated document reprocessing
 - use metadata filtering to reduce retrieval cost
 - limit context windows to relevant chunks
-- monitor token usage and model cost continuously
+- attribute request counts, tokens, retries and provider cost by route/model/stage, including failed attempts and background ingestion/evaluation
+- enforce model-specific token, route call/fan-out and provider concurrency budgets; batch ingestion embeddings only within provider quotas and reserve interactive capacity
+- avoid serial LLM agents: simple questions use no planning call and at most one grounded response call; follow-up planning is conditional; recommendations use deterministic eligibility and at most one optional post-validation explanation
+- monitor cost per successful workflow and set spend/alert thresholds from measured usage with finance/platform owners
 - set budget alarms and usage guardrails for operations teams
 
 ---
@@ -625,7 +633,7 @@ Use gold-standard question sets with:
 - LangSmith: optional for redacted LLM experiments/traces; OTel/Azure remains the production operations source of truth
 - BGE cross-encoder: recommended for reranking quality
 - NeMo Guardrails: retain as the documented dialogue/input-output guardrail layer, backed by mandatory deterministic application controls for authorization, PII, schema, grounding and citation validation
-- Microsoft Presidio: candidate PII detection/anonymization implementation if required by the data-classification policy; not currently selected/deployed and not a replacement for NeMo or access controls
+- Microsoft Presidio: reference implementation for PII detection/masking at external model and trace boundaries when required by data classification; an approved enterprise DLP equivalent may replace it. Neither is NeMo, authorization, or citation validation. The selected service and its production configuration must be verified before release.
 
 ### Avoid unless justified
 
@@ -665,7 +673,7 @@ flowchart TD
 
     Admin[Internal Admin / Operations] --> DocUI[Document Upload Portal]
     DocUI --> Blob[(Azure Blob Storage)]
-    Blob --> Event[Event Broker / Kafka or Event Hubs]
+    Blob --> Event[Managed Kafka broker]
     Event --> Airflow[Airflow Orchestration]
     Airflow --> DocIntel[Azure AI Document Intelligence]
     DocIntel --> Norm[Normalization / OCR / Table Extraction]
@@ -746,6 +754,7 @@ This parent README is the top-level reference. Supporting design documents are l
 - [backend-architecture.md](./backend-architecture.md)
 - [24-rag-enhancement-decisions.md](./docs/architecture/24-rag-enhancement-decisions.md)
 - [25-architecture-interview-readiness.md](./docs/architecture/25-architecture-interview-readiness.md)
+- [26-final-architecture-review.md](./docs/architecture/26-final-architecture-review.md)
 
 ### Detailed document coverage
 
@@ -754,6 +763,7 @@ This parent README is the top-level reference. Supporting design documents are l
 - [backend-architecture.md](./backend-architecture.md): service responsibilities, FastAPI backend design, and dependency model
 - [24-rag-enhancement-decisions.md](./docs/architecture/24-rag-enhancement-decisions.md): item-by-item evaluation, trade-offs, final retrieval strategy, and Principal Architect review
 - [25-architecture-interview-readiness.md](./docs/architecture/25-architecture-interview-readiness.md): concise interview answers, architecture diagrams, explicit gaps, and Principal Architect review
+- [26-final-architecture-review.md](./docs/architecture/26-final-architecture-review.md): final readiness verdict, launch gates, scaling risks, and prioritized architecture actions
 
 ---
 

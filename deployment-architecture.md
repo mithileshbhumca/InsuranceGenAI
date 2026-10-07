@@ -41,7 +41,7 @@ The deployment architecture must provide:
 - Azure Monitor
 - Application Insights
 - Azure API Management or equivalent ingress gateway
-- One managed event broker (Kafka or Event Hubs) where needed; do not deploy both by default
+- One managed Kafka broker for document-ingestion events; do not deploy a second broker for the same workflow
 - Azure SQL / PostgreSQL only if a relational store is required for specific workflows
 
 ### Why this stack is appropriate
@@ -72,11 +72,11 @@ flowchart TD
 
     Admin[Internal Admin / Ops] --> Portal[Document Upload Portal]
     Portal --> Blob[(Azure Blob Storage)]
-    Blob --> Event[Event Broker / Kafka or Event Hubs]
-    Event --> Ingest[Ingestion Workers]
-    Ingest --> DocIntel[Azure AI Document Intelligence]
-    DocIntel --> MQ[Processing Queue]
-    MQ --> Workers[Chunking / Embedding Workers]
+    Blob --> Event[Managed Kafka broker]
+    Event --> Ingest[Kafka consumer / workflow trigger]
+    Ingest --> Airflow[Airflow workflow stages]
+    Airflow --> DocIntel[Azure AI Document Intelligence]
+    DocIntel --> Workers[Bounded chunking / embedding workers]
     Workers --> Qdrant
     Workers --> Mongo[(MongoDB)]
 
@@ -132,7 +132,7 @@ This contains the storage systems:
 
 - Qdrant for embeddings and retrieval
 - MongoDB for metadata, versioning, and audit metadata
-- Redis for hot cache and rate limiting
+- Redis for optional scoped cache/session acceleration and rate limiting
 - Azure Blob Storage for source and processed documents
 
 ### 4.4 Observability layer
@@ -176,7 +176,7 @@ This contains:
 ### Runtime patterns
 
 - Deploy stateless services behind Kubernetes Deployments
-- Use HPA (Horizontal Pod Autoscaler) based on CPU, memory, and request throughput
+- Use HPA/KEDA or equivalent scaling based on CPU/memory plus request concurrency, queue depth/age and worker lag where supported; keep explicit min/max replicas and per-dependency concurrency caps
 - Use Jobs or CronJobs for asynchronous ingestion and document processing tasks
 - Use Kubernetes Secrets for non-sensitive values if Key Vault integration is not yet fully available
 
@@ -207,6 +207,12 @@ flowchart LR
 - Internal services: REST or async event-driven comms
 - Event broker for asynchronous ingestion workflows
 - No direct exposure of internal services to the internet
+
+### Selected ingestion event/orchestration path
+
+Use **one managed Kafka broker** for document-ingestion events. Airflow coordinates durable, observable workflow stages; bounded Kafka consumer workers perform extraction, chunking, embedding and index writes. Airflow is not a broker or a substitute for worker-level idempotency. Event delivery is at-least-once; consumers use a stable key derived from tenant/source document ID/checksum/version/pipeline generation, commit/ack only after stage state is durable, and make each stage repeatable.
+
+Partition by the stable document/job key to preserve ordering for a document version while allowing independent documents to process in parallel. Bound consumer concurrency by OCR/embedding/provider quotas and online capacity. Airflow owns bounded stage retry policy; Kafka provides at-least-once redelivery when a message is not durably acknowledged, not an additional application retry loop. Worker client retries must remain within the current task/request budget and honor provider throttling; do not stack independent retry policies. After exhaustion, route poison/non-retryable events to a DLQ with an assigned operator, replay runbook and audit trail. Publish a generation only after MongoDB/Qdrant reconciliation. The concrete managed Kafka offering, partitions, retention, consumer count, Airflow executor, per-stage retry limits and DLQ owner are deployment configuration values that must be recorded and load-tested before production; do not add Event Hubs as a second broker for this flow.
 
 ### Why this matters
 
@@ -338,6 +344,14 @@ flowchart LR
 
 For LangSmith or any external trace service, apply approved data residency, retention, access, sampling, and redaction rules. Prefer opaque references over raw customer conversations, PII, or full retrieved passages. Telemetry export failure must not affect serving.
 
+### Production dashboards and alert ownership
+
+Use a service-level dashboard for each user route (simple Q&A, follow-up/personalized Q&A, recommendation) and a dependency dashboard for each upstream/data/compute tier. Each route dashboard shows request rate, errors, in-flight work, end-to-end P50/P95/P99, saturation/admission rejects, and completed/clarification/abstention/escalation outcomes. Dependency views show per-stage latency/error/throttling and pool wait for auth/customer/catalog/rules, history, query embedding, Qdrant dense/lexical, fusion, BGE, LLM, guardrails/citation validation, MongoDB, Redis, Kafka/Airflow and OCR/embedding workers.
+
+Track tokens, provider cost and retries per model/stage/route/outcome, retrieval candidate counts and scores, index freshness, citation rejection, route confusion, cache bypass/scope faults, queue age/lag/DLQ, and restore/test status. Use low-cardinality dimensions (route, model/config version, product family/jurisdiction only where approved); use opaque IDs in traces, not customer identifiers or raw prompt/passages in metric labels.
+
+Every alert must have an owner, severity, runbook and safe user-impact action. Derive thresholds from approved SLO/error budgets, baseline distributions and critical business cases; do not page on raw metric changes without an actionable response or invent numeric cutoffs in architecture docs. Page for user-impacting SLO burn, cross-tenant/scope violation, critical citation/authorization failure, index-version inconsistency, or sustained dependency saturation; route cost, retry, freshness, quality and queue trends to the accountable operations/product team at agreed thresholds. Review alert noise and ownership during load/failure exercises. Monitoring/evaluator export outages do not gate user requests, but loss of required security or source-integrity signals must disable affected workflows.
+
 ### Example dashboard categories
 
 - API latency and availability
@@ -345,6 +359,12 @@ For LangSmith or any external trace service, apply approved data residency, rete
 - retrieval quality metrics
 - ingestion throughput and failures
 - safety/guardrail events
+- route-level request rate, errors, in-flight requests, and P50/P95/P99
+- per-dependency latency, timeout/429 rate, pool wait, circuit state, and saturation
+- Kafka consumer lag/oldest-event age, Airflow queue/run duration, retries and DLQ
+- Qdrant search/filter latency and index freshness; BGE queue wait/throughput
+- MongoDB pool/slow-query metrics and Redis hit/eviction/invalidation metrics
+- cache-scope/version validation failures and fallback/bypass rate
 
 ---
 
@@ -381,15 +401,64 @@ For LangSmith or any external trace service, apply approved data residency, rete
 - request rate
 - queue depth
 - latency threshold breaches
+- in-flight request count, queue age/consumer lag and worker utilization
+- per-dependency saturation and throttling, while respecting provider quotas
 
 ### Scaling design principles
 
 - stateless services where possible
 - decouple ingestion from user traffic
-- cache common retrieval outputs to reduce compute load
+- cache only measured immutable public/role-scoped retrieval outputs; personalized outputs remain uncached by default and all cache entries follow the cache-safety contract
 - scale ingestion workers against broker lag and downstream provider quotas; partitioning/concurrency must preserve document-version publication gates
 - size Qdrant from chunk/vector count, dimensions, payload indexes, filter selectivity, concurrency, and replicas—not document count alone
 - thousands of source documents are an intended target, not a measured capacity claim; benchmark representative files, burst ingestion, re-index overlap, and recovery before committing throughput/latency SLOs
+
+### Tier qualification and protective limits
+
+Capacity tests must size each tier separately; a passing API-only test is not evidence that the complete workflow can meet its SLO.
+
+| Tier | Qualification evidence | Runtime protection |
+|---|---|---|
+| FastAPI / gateway | Concurrent requests, event-loop lag, connection-pool wait, route-specific P50/P95/P99 and overload behavior | Async network I/O, bounded worker and outbound pools, request-size/rate limits, admission control |
+| LangGraph | Node duration/errors, state size, fan-out, cancellation and per-route model/tool calls under concurrency | Request-scoped typed state, per-node/overall deadlines, bounded fan-out and semaphores, no shared mutable request state |
+| Qdrant | Recall@K, memory, search/filter P50/P95/P99 under realistic vector count, payload filters, concurrency and index rebuild | Workload-derived HNSW/index/shard/replica config, payload indexes, bounded search concurrency, isolate or throttle re-index |
+| MongoDB | Read/write latency, slow queries, pool wait, lineage reconciliation and retention load | Query-path indexes, bounded pools, capped connections and governed retention |
+| Redis | Hit rate, avoided dependency latency, memory/eviction, invalidation delay and failover/bypass behavior | Optional cache only, TTL/eviction policy, scoped keys, bounded memory; fail through only after authorization |
+| BGE | Batch throughput, queue wait, memory/CPU/GPU and reranking latency at configured candidate count | Bounded candidate top-N, batch size and concurrency; timeout and safe abstention path |
+| Kafka/Airflow/workers | Ingestion throughput and freshness under bursts, replay, DLQ, OCR/embedding throttles and re-index concurrent with serving | Partition by stable document key, bounded consumers/workers, provider quota limits, bounded retry budget and backpressure |
+| LLM/embedding/OCR/customer/catalog/rules APIs | Provider quotas, 429/timeouts, latency distribution, cost and degradation/fallback behavior | Per-provider concurrency limits, request deadlines, retry-after/jitter, online quota reservation and admission control |
+
+Set pool sizes, worker counts, queue limits and autoscaling thresholds only from representative measurements and provider/service limits. Keep minimum operational capacity and maximum concurrency explicit. On saturation, reject or defer bounded work with a clear retryable status instead of allowing unbounded queueing or retry storms.
+
+### Production capacity qualification
+
+The 20,000–40,000 customer population is not a capacity input by itself. Before production, product/platform owners must define and approve:
+
+- peak and burst arrival rates, concurrent sessions, request mix and expected response size for simple Q&A, follow-up/personalized Q&A, and recommendations;
+- service-level objectives and budgets for P50/P95/P99 latency and availability by workflow;
+- background upload, backfill and re-index volumes, plus allowed freshness lag;
+- model, embedding, OCR, customer-data, catalog and rules API quotas and rate limits;
+- acceptable cost per workflow and load-shed/admission-control behavior.
+
+Run an end-to-end load test with representative documents, tenants/filters, token distributions, route mix and configured dependencies. Include peak plus business-approved headroom, burst traffic, ingestion concurrent with online traffic, throttling, slow dependencies, and recovery. Measure throughput, in-flight requests, queue age, per-stage and end-to-end P50/P95/P99, errors, token cost, and resource saturation. Do not publish capacity or SLO claims until results meet the approved targets. No assumed active-user percentage, request rate, latency target, or capacity figure is set by this document.
+
+The qualification record must identify the tested software/configuration and dataset/workload profile, approved targets and provider quotas, observed limits/headroom, degraded-mode results, unresolved risks, and product/platform sign-off. Preserve the results with the release evidence; a customer-population estimate or isolated component benchmark is not a capacity approval.
+
+Scale API/graph workers, BGE, Qdrant, MongoDB, Redis, and ingestion independently from observed bottlenecks. Bound outbound connection pools, graph fan-out, worker concurrency, retrieval candidates and per-provider concurrency; apply admission control and backpressure rather than unbounded queues/retries. Keep offline evaluation, ingestion and re-index work from consuming unreserved interactive model/provider quota.
+
+### Production release evidence checklist
+
+Before enabling a user-facing workflow, retain the evidence appropriate to that workflow:
+
+- Approved route-specific P50/P95/P99 and availability objectives, with stage budgets, remaining-time propagation, cancellation and overload behavior demonstrated in end-to-end tests.
+- Per-tier concurrency/saturation tests and configured pool, queue, worker and autoscaling limits; do not infer capacity from component-only benchmarks.
+- One selected managed Kafka service and recorded partition, retention, consumer, Airflow retry, provider-quota and DLQ ownership settings; verify idempotent replay and re-index overlap.
+- Versioned SME evaluation corpus, approved per-segment quality thresholds, deterministic critical-case test results, and release/canary owner sign-off.
+- Published versioned recommendation OpenAPI contract and client compatibility tests before enabling the endpoint; until then, its default-off behavior remains in force.
+- If caching is enabled, measured benefit plus authorization-scope, freshness/invalidation and outage-bypass test results; otherwise leave response caching disabled.
+- For P2 optimization claims, retain retrieval comparisons against the semantic + BGE baseline, observed model/token/cost and per-route call counts, and deployed dashboard/alert exercise results. Leave hybrid retrieval, MMR, compression and response caching off when their benefit and safeguards are unproven.
+
+These are deployment/release evidence requirements, not claims that the environment is already configured or has passed qualification.
 
 ```mermaid
 flowchart LR
@@ -429,6 +498,12 @@ Airflow coordinates durable, observable workflow stages; it is not a substitute 
 - stateful stores with redundancy and backup
 - event-driven async processing decoupled from core API traffic
 
+### Recovery objectives and restore gate
+
+Business and regulatory owners must set RPO/RTO per workflow and data class; this architecture intentionally does not invent numeric objectives. Record the approved objectives, backup cadence/retention, regional recovery scope and named operators in the service runbook. Before production, exercise restoration of immutable Blob sources, MongoDB lineage, Qdrant snapshots/collections, and broker/job replay state. Reconcile source checksums, document/version/chunk manifests, ACL/effective-date metadata and active-generation markers before enabling retrieval. Rebuild Qdrant from approved source artifacts when integrity cannot be established; never treat a restored cache or vector index as authority.
+
+Recovery sequence: establish trusted identity/network access; restore or verify source documents and metadata; restore/replay index and ingestion state; reconcile generations and run citation/access smoke tests; then enable workflows. If an authoritative dependency or version cannot be validated, keep affected personalized/policy workflows unavailable and route users to an explicit retry or human-support path. Record achieved restore times and data loss against the approved RPO/RTO; production approval requires a successful exercise.
+
 ---
 
 ## 14. Security-by-Design Deployment Checklist
@@ -436,11 +511,14 @@ Airflow coordinates durable, observable workflow stages; it is not a substitute 
 - private endpoints enabled for database and storage services
 - managed identity configured for all workloads
 - Key Vault used for all secrets and service credentials
+- approved data classes, external destinations and vendor processing terms recorded; approved PII/DLP control configured and tested before classified PII is sent to external model or trace services; NeMo is not a substitute
 - WAF enabled at edge
 - RBAC applied to every service and resource
 - network segmentation between app, data, and ingestion layers
 - no admin APIs exposed externally
 - audit logs retained for compliance and investigations
+- approved workflow-specific availability/latency and RPO/RTO objectives recorded and exercised
+- recommendation endpoint release control defaults to disabled and is changed only after the documented integration, governance and test gate passes; disabled-path tests verify authentication/endpoint permission, generic unavailability, and no customer lookup or downstream calls
 
 ---
 
@@ -493,7 +571,7 @@ flowchart TD
 
     Admin[Admin / Operations] --> Portal[Upload Portal]
     Portal --> B
-    B --> EV[Event Broker / Event Hubs / Kafka]
+    B --> EV[Managed Kafka broker]
     EV --> JOBS[Ingestion Workers]
     JOBS --> DOC[Document Intelligence]
     DOC --> CHUNK[Chunking and Embedding]

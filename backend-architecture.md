@@ -251,6 +251,7 @@ Use Pydantic schemas for:
 - conversation request
 - policy query request
 - claims lookup request
+- recommendation request with explicit subject authorization, purpose/consent and idempotency header
 - document upload request
 - admin workflow action request
 
@@ -262,9 +263,12 @@ Use structured response models for:
 - guardrail status
 - retrieval metadata
 - workflow trace summary
+- recommendation response with outcome, source/rule/catalog versions, timestamps, disclosures, citations and stable error envelope
 - distinct policy facts, customer facts with source/freshness, deterministic business-rule results with reason codes, and model-generated explanation/recommendation
 
 The API must not flatten these categories into an unattributed answer string. Policy facts cite approved document evidence; customer facts identify the authorized system of record and verification time; eligibility outcomes identify the governed rule/version. Recommendations/explanations are explicitly non-binding unless a separately approved workflow defines otherwise. Server-side validation resolves citation IDs and rejects unsupported material claims.
+
+The recommendation endpoint is a bounded synchronous operation in the target contract. Use stable outcomes for completed/no candidates/insufficient data/review required and a common error envelope (`code`, `message`, `trace_id`, `retryable`). Map authentication/authorization, invalid input, idempotency conflict, rate limit, dependency unavailable and deadline expiry distinctly; do not return partial candidates if a required source or rule service failed. Keep a server-side release control disabled by default until its authoritative integrations and API contract are implemented, tested and approved. While disabled, authenticate the caller and verify endpoint-level permission without looking up the customer, then return a generic `503 recommendation_unavailable` with a trace ID. When enabled, verify subject authorization and consent/purpose before reading customer data. Do not reveal customer existence or fall back to conversational generation.
 
 ### Example response skeleton
 
@@ -307,7 +311,7 @@ Some backend workflows are not user-interactive and should run asynchronously.
 - Use async job queues or event-driven processing for these tasks
 - Keep synchronous user-facing workflows short and responsive
 - Do not block the user API while large ingestion or indexing tasks execute
-- Kafka/Event Hubs delivery and worker execution are treated as at-least-once; do not claim exactly-once side effects
+- The selected Kafka ingestion broker and worker execution are treated as at-least-once; do not claim exactly-once side effects
 
 ### Idempotency and replay boundaries
 
@@ -316,8 +320,12 @@ Some backend workflows are not user-interactive and should run asynchronously.
 - On duplicate broker delivery, acknowledge a completed stage as a no-op; route conflicting checksums or non-retryable poison events to a dead-letter queue for review.
 - LangGraph node replay is not equivalent to idempotent LLM output. Keep model calls bounded by node/request deadlines and retry only transient provider errors. For side-effecting tools, pass an idempotency key and reconcile operation status before retry; never assume a model call has exactly-once semantics.
 - Keep retries capped with jitter, per-dependency timeouts, an overall request deadline, and circuit breakers for sustained failures. Cancel sibling parallel work when its result can no longer affect a response.
+- Set an API-level deadline and pass remaining time to every graph node/dependency; nested retries must not exceed it. Use async I/O for network-bound dependencies, separate bounded pools/semaphores per dependency, and fail-fast overload responses when admission limits are reached.
+- Retry only transient/idempotent operations within the remaining deadline; do not retry validation, authorization, stale-version, or deterministic rule failures. Honor provider retry-after guidance for throttling and use a shared per-request retry budget.
 
 The graph state should be a minimal, typed, request-scoped object with authorized scope, correlation/idempotency key, route, validated evidence references, rule result, deadline, and terminal outcome. Persistent checkpoint storage and retention are not specified; disable durable checkpoints until their security, privacy, and recovery requirements are approved.
+
+Interactive route deadlines are end-to-end budgets, not independent timeouts that can accumulate. Allocate a budget to authorization, optional history/customer reads, retrieval/reranking, generation, guardrails/citation validation, and response serialization for each route. Product owners must set the numeric objectives; the backend enforces remaining-time propagation and cancels work on deadline. Ingestion, offline Ragas, trace export and nonessential summary refresh remain asynchronous and outside the interactive request budget.
 
 ---
 
@@ -387,7 +395,7 @@ These tools address different risks and are not substitutes:
 | Microsoft Presidio (or an approved equivalent DLP/PII service) | Detect and optionally anonymize identifiable text before an external model/trace boundary | Identity/authorization, business-purpose minimization, prompt-injection defense, policy grounding, or citation validation |
 | NeMo Guardrails | Dialogue/input/output policy checks and configured safety/behavior rails | Reliable PII discovery, access control, source-of-truth verification, deterministic rules, or schema/citation checks |
 
-For insurance data sent to a model or third-party trace service, first minimize fields and avoid sending data not needed for the task. Add a PII detection/masking control when the approved data classification requires it; Presidio is a candidate implementation, not an already selected/deployed component. Calibrate recognizers for policy identifiers and regional formats, measure false negatives/positives, and ensure masked prompts remain useful. If answer generation requires customer details, fetch and validate those through authorized systems and apply only approved, scoped restoration/rendering outside the model. Do not log raw text as a workaround.
+For insurance data sent to an external model or trace service, first minimize fields and avoid sending data not needed for the task. When classified PII may cross that boundary, use Microsoft Presidio as the reference detection/masking implementation or an approved enterprise DLP equivalent that passes the same tests. Calibrate recognizers for policy identifiers and regional formats; measure false negatives/positives and verify masked prompts remain useful. Do not restore masked identifiers inside model context. If a response requires an identifier, render it only through an authorized application path after response validation. Redact traces independently; do not log raw text as a workaround.
 
 NeMo can complement that PII layer for prompt injection and dialogue policy. Neither tool is a security boundary by itself: enforce authZ before retrieval and validate structured output, provenance, citations, and customer data in deterministic application code.
 
@@ -408,7 +416,7 @@ flowchart LR
     VALIDATE -->|Fail| SAFE[Reject, abstain or human review]
 ```
 
-The deployment must define whether masked values are ever restored, which PII classes are in scope, and what is retained. Those policies and the Presidio deployment choice remain implementation gaps.
+Before release, document approved PII classes, model/trace destinations and terms, masking behavior, audit/trace retention and deletion, and detector outage handling. Verify the selected Presidio/DLP configuration with regional insurance identifiers, false-negative testing, output checks and trace-redaction tests. If masking is required by policy and the control is unavailable, do not send the affected data externally; fail closed or route to an approved non-external workflow. NeMo configuration does not satisfy this PII gate.
 
 ---
 
@@ -421,10 +429,12 @@ The backend must create rich operational telemetry.
 - request latency by endpoint
 - error rate and exception traces
 - retrieval latency and status
-- model latency and token usage
+- model/provider latency, per-attempt token usage, retry count, and cost by route and stage
 - business workflow state transitions
 - safety and guardrail triggers
 - audit events for policy or claims answers
+- in-flight requests, dependency pool wait, event-loop lag, admission rejects and P50/P95/P99 by route
+- queue age/consumer lag/DLQ, Qdrant/BGE saturation, cache bypass/invalidation, citation rejects and no-hit/abstention/escalation outcomes
 
 ### Implementation
 
@@ -433,6 +443,9 @@ The backend must create rich operational telemetry.
 - trace IDs linking user request → orchestration → retrieval → answer
 - centralized dashboards and alerting in Azure Monitor / Application Insights
 - stage-level metrics for query rewrite, routing, dense/lexical search, fusion, optional MMR/compression, BGE, generation, guardrails, and citation validation
+- record every model attempt in the request call ledger with model/config version, stage, token count, retry reason, latency and outcome; attribute embedding/OCR and background evaluation spend separately from interactive generation
+- use low-cardinality metric labels (route, model, stage, outcome); never label metrics with customer IDs or raw content; use opaque identifiers in access-controlled traces
+- configure alert thresholds from approved SLOs and measured baselines, with named owners/runbooks; monitor calls/route and token/cost budget exhaustion without logging prompt contents
 - Ragas runs offline or asynchronously on privacy-reviewed samples; it never blocks a synchronous user response
 - LangSmith is optional for redacted LLM experiments/traces and does not replace OTel/Azure production telemetry
 - avoid raw conversation, PII, or full retrieved passages in ordinary logs; use opaque references, redaction, and governed trace access
@@ -473,7 +486,7 @@ Failure should degrade safely, not silently provide incorrect customer-specific 
 - replicate API pods behind the gateway
 - independently scale retrieval and orchestration layers
 - use queue-based ingestion processing
-- cache frequently requested FAQs and customer policy facts
+- cache public/role-scoped FAQ evidence only when measured; personalized facts and eligibility are not cache authorities
 
 ### Adaptive scaling triggers
 
@@ -481,6 +494,13 @@ Failure should degrade safely, not silently provide incorrect customer-specific 
 - LLM latency and queue backlog
 - retrieval latency and Qdrant load
 - storage workload for ingestion
+- worker queue wait, dependency connection-pool wait, event-loop lag, and provider throttling/saturation
+
+Use bounded async connection pools for CRM/policy/claims, MongoDB, Redis, Qdrant, embedding and LLM clients. Keep per-dependency concurrency limits and request deadlines so a slowdown cannot exhaust all API workers. Apply bulkheads between interactive workflows and background ingestion/evaluation. Autoscaling adjusts capacity but does not replace overload control: use gateway admission/rate limits and bounded queues, and return a retryable overload response when safe capacity is exhausted.
+
+### Cache safety
+
+Redis is optional acceleration, not a source of truth. Prefer immutable, approved public/role-scoped retrieval evidence. Partition entries by tenant and authorization scope and include every result-affecting dimension (jurisdiction, effective date, document/index generation, retrieval configuration and prompt/schema version as applicable). Reauthorize before use and invalidate on source, ACL, policy-version or configuration changes. Never cache eligibility/rule decisions or authoritative customer facts. Personalized response caching is disabled by default; enable only with a documented benefit, scoped key design, short approved TTL, invalidation tests and a verified cache-bypass path. If safe scope or freshness cannot be checked, bypass the cache.
 
 ---
 
@@ -658,9 +678,9 @@ The backend must treat authorization, customer context, policy evidence, and res
 ### Scenario: Redis session/cache outage or cache contains stale data
 
 - **Why it can happen:** Redis failover, network interruption, memory pressure, eviction, TTL/configuration error, or cache key omits authorization/version scope.
-- **How the architecture detects it:** Cache connection errors, hit/miss and eviction metrics, TTL checks, and verification of cached customer, tenant, and document-version metadata.
-- **How the system handles/recover from it:** Treat cache as non-authoritative; bypass it and read from the source of truth when safe. Invalidate entries after permission or document-version changes; use scoped keys and bounded TTLs.
-- **Fallback behavior:** Reconstruct session context or require the user to restate lost context; if authorization scope cannot be re-established, do not serve cached customer data.
+- **How the architecture detects it:** Cache connection errors, hit/miss and eviction metrics, TTL checks, and validation of cached tenant/authorization scope and document/index-version metadata.
+- **How the system handles/recover from it:** Treat cache as non-authoritative; bypass it and read from the source of truth when safe. Invalidate entries after ACL, document/version, index-generation or configuration changes; use scoped keys and approved TTLs. Do not cache eligibility or customer facts as authority.
+- **Fallback behavior:** Reconstruct ephemeral session context or require the user to restate lost context; if authorization scope or evidence freshness cannot be re-established, bypass the cache and do not serve customer-specific data.
 - **Impact on the user/system:** Higher latency or loss of conversational continuity; no correctness or access decision relies solely on cache.
 - **Monitoring/alerting required:** Monitor Redis availability, memory/evictions, cache hit rate, invalidation lag, and detected scope/version mismatches.
 

@@ -94,6 +94,19 @@ Treat the roles below as **workflow responsibilities**, not nine separate autono
 
 Accordingly, the graph has a supervisor, conditional workflow nodes/subgraphs, deterministic services, and only a small number of bounded language-model calls. A simple FAQ should take a short direct path; a multi-step recommendation uses more nodes because its distinct data and rule gates justify the complexity.
 
+### Model-call budget by route
+
+Use one request-scoped call ledger recording every external model/provider attempt, including any model invocation configured inside a guardrail, with node, model/configuration version, attempt, token usage, deadline time and outcome. The expected route shape is:
+
+| Route | Model calls allowed by default | Control |
+|---|---|---|
+| Self-contained simple FAQ/policy question | One grounded response-generation call at most; no routing, policy-reasoning or guardrail-judge LLM call | Deterministic route and retrieval; abstain/template for supported fixed outcomes |
+| Ambiguous follow-up | One bounded rewrite/planning call only when needed, then at most one grounded response call | Preserve original query; validate intent/scope; clarification instead of retrying uncertain rewrites |
+| Complex multi-facet Q&A | One bounded planning/decomposition call only when deterministic parsing is insufficient, then at most one grounded response call | Cap subquery/fan-out count and total tokens; no per-subquery generation |
+| Product recommendation | Zero or one constrained explanation call after deterministic rules/candidate validation | Never call a model to decide eligibility, rank candidates, fill missing inputs or repair a dependency failure |
+
+Do not add a separate policy-reasoning call when the grounded response call can synthesize already validated evidence and deterministic results. Do not call an LLM to select a domain when deterministic routing is confident; do not call an online judge after generation. Retries are governed by the shared request deadline and retry budget, and every attempt—including guardrail/provider calls—is included in cost/telemetry. If a route would exceed its approved call/token budget, skip optional planning/explanation or return the safe clarification/abstention outcome. Numeric caps for complex fan-out and token budgets are model- and workload-specific configuration approved after evaluation, not implied here.
+
 ### LangGraph state and execution
 
 Use a request-scoped typed state containing correlation/trace ID, authenticated scope, workflow type, original query, bounded history references, routing decision/confidence, validated customer facts and freshness, evidence IDs/source versions, catalog/rule versions, deadline/retry budget, and final status. Pass immutable source references between nodes where possible; do not place raw unbounded transcripts or global cross-request memory in graph state. Durable checkpoint storage, encryption, retention and replay policy are not selected; keep persistence disabled until those controls are approved.
@@ -231,7 +244,7 @@ flowchart TD
     ADMIN[Authorized document owner] --> UPLOAD[Upload approved document]
     UPLOAD --> BLOB[(Blob: immutable source)]
     BLOB --> EVENT[Document event]
-    EVENT --> BROKER[One selected broker<br/>Kafka or Event Hubs]
+    EVENT --> BROKER[Managed Kafka broker]
     BROKER --> AIRFLOW[Airflow workflow]
     AIRFLOW --> DI[Azure AI Document Intelligence]
     DI --> NORMALIZE[Normalize text, layout, tables and page anchors]
@@ -249,7 +262,7 @@ flowchart TD
     BROKER -. transient retries exhausted .-> DLQ[Dead-letter queue / operator replay]
 ```
 
-The broker decouples upload bursts from workers; Airflow coordinates durable stages; workers may process independent documents concurrently within service quotas. Treat broker delivery as at-least-once, not exactly-once. Use stable document/checksum/version/pipeline idempotency keys, idempotent stage writes and explicit dead-letter replay.
+The selected architecture uses one managed Kafka broker to decouple upload bursts; Airflow coordinates durable stages; bounded Kafka consumers/workers process independent documents within service quotas. Partition by stable document/job key and treat delivery as at-least-once, not exactly-once. Use idempotent stage writes, explicit acknowledgements and DLQ replay. The concrete managed Kafka offering, partition/retention settings, consumer counts, Airflow executor, quotas, retry limits and DLQ owner are deployment settings that must be recorded and load-tested; do not introduce a second broker for this flow.
 
 ### Cross-document references and citations
 
@@ -352,7 +365,7 @@ Customer context is fetched through authorized service calls to CRM, policy admi
 - Eligibility and suitability are evaluated by deterministic, versioned rules using validated customer facts and current catalog data.
 - If a required source is unavailable or stale beyond its approved freshness window, do not return a customer-specific determination.
 
-The exact customer APIs, fields, freshness SLAs, consent/data-purpose checks and product-catalog service are not selected in this architecture; they must be defined by integration and data-governance owners.
+The architecture requires authenticated adapters to the enterprise systems of record, but does not name or claim existing APIs. Before enabling personalized answers, define each adapter's schema, authorization/purpose contract, freshness bound, timeout, and unavailable/stale response. Before enabling recommendations, the profile, policy/coverage, permitted claims, catalog, and deterministic rule interfaces must all be selected and contract-tested. A missing integration is a workflow launch blocker, not permission to infer facts or fall back to LLM memory.
 
 ## 8. Q&A Flow
 
@@ -407,7 +420,7 @@ Product recommendation is a dedicated use case and API, not an implicit side eff
 POST /api/v1/recommendations
 ```
 
-The endpoint is a **proposed contract**; no implementation is asserted. Authenticate and authorize the subject customer, enforce consent/purpose requirements, and validate product catalog and rules versions.
+This is the target endpoint contract; no implementation is asserted. The route must remain disabled until the enterprise customer, current catalog, and versioned eligibility/suitability rule integrations and their governance contracts pass the launch gates below. Authenticate and authorize the subject customer, enforce consent/purpose requirements, and validate product catalog and rules versions.
 
 Example request:
 
@@ -421,11 +434,18 @@ Example request:
 }
 ```
 
+Send an `Idempotency-Key` header for retryable client submissions. The key is scoped to caller/tenant and endpoint; identical payload retries within the approved idempotency retention window return the same operation result, while reuse with a different payload returns `409 idempotency_conflict`. The retention period is a deployment/API contract value, not set here.
+
 Example response:
 
 ```json
 {
   "status": "completed",
+  "outcome": "recommended",
+  "evaluated_at": "2026-10-07T00:00:00Z",
+  "customer_data_as_of": "2026-10-07T00:00:00Z",
+  "catalog_version": "catalog-version",
+  "rules_version": "rule-version",
   "recommendations": [
     {
       "product_id": "catalog-product-id",
@@ -454,7 +474,9 @@ Example response:
 }
 ```
 
-Use actual contract enums, field constraints, error models and pagination only after API/schema design; the example does not assert those are implemented.
+The example illustrates the target response shape, not a released API. Initial recommendations are a **synchronous, bounded request** with a request deadline; asynchronous job submission is out of scope unless later workload measurements show it is required and a separate operation-status contract is approved. Publish a versioned OpenAPI schema with field constraints, authentication/subject authorization, consent/purpose, idempotency, freshness timestamps, catalog/rule versions, citation provenance, disclosures, and stable outcomes/errors.
+
+For HTTP `200`, set `status: "completed"` and `outcome` to `recommended`, `no_eligible_products`, `insufficient_data`, or `review_required`; return no candidate list when there is no eligible, supported recommendation. Use `401` for unauthenticated callers, `403` for authorization/purpose denial without disclosing whether a customer exists, `422` for invalid input, `409` for idempotency-key reuse with a different request, `429` for rate limiting, `503` when a required dependency is unavailable or its source/version is not trustworthy, and `504` when the bounded request deadline expires. Errors use a stable `{ "code", "message", "trace_id", "retryable" }` envelope; include `Retry-After` for throttling when available. Do not return partial recommendations when a required dependency fails.
 
 ### Recommendation data and node responsibilities
 
@@ -473,19 +495,24 @@ Use actual contract enums, field constraints, error models and pagination only a
 - Missing/stale profile, policy or claim data → return `insufficient_data` or source-unavailable status; do not assume eligibility.
 - Catalog/rule version mismatch → stop before ranking and retry/reconcile; fallback is no recommendation, not an older product list unless explicitly valid.
 - No eligible candidates → return no-match with approved reason codes; do not ask LLM to invent an alternative.
+- Dependency timeout/throttle or retry → obey the request deadline and provider retry guidance; deduplicate client retries with the scoped idempotency key; return the defined unavailable/deadline error without partial candidates.
 - RAG source missing or conflicting → omit unsupported product claims, request review, or return no recommendation when material terms cannot be verified.
 - Unsupported suitability/regulatory situation → human advisor review; the LLM explanation is non-binding.
 
-Production decisions still required include real catalog/rules APIs, data freshness, product-ranking governance, consent/purpose checks, status/error codes, recommendation audit retention, and compliance approval of disclosures.
+**Recommendation launch gate:** Keep the endpoint disabled by default using a server-side release control. Enable it only after customer/policy/claims (as permitted), catalog, and deterministic rules interfaces are implemented and contract-tested; data freshness and version conflicts are enforced; candidate ranking and reason codes have named business/compliance owners; consent/purpose, disclosures, audit retention, idempotency, and error semantics are approved; and no-match, insufficient-data, stale-source, timeout, throttling, and dependency-outage cases pass tests. While disabled, authenticate the caller and verify endpoint-level permission without looking up the customer, then return a generic `503 recommendation_unavailable` response with a trace ID. When enabled, verify subject authorization and consent/purpose before reading customer data. Do not expose rollout state or customer existence, return partial candidates, route the request through conversational Q&A as a substitute, or use an LLM to fill integration gaps.
 
 ### Recommendation Flow Diagram
 
 ```mermaid
 flowchart TD
     CLIENT[Customer / advisor client] --> ENDPOINT[POST /api/v1/recommendations]
-    ENDPOINT --> AUTH[Authenticate, authorize subject and validate purpose]
+    ENDPOINT --> AUTH[Authenticate caller and verify endpoint permission]
     AUTH -->|Denied| DENY[Generic denial; no customer data disclosure]
-    AUTH -->|Allowed| FANOUT{Authorized data reads}
+    AUTH -->|Allowed| GATE{Server-side release control enabled?}
+    GATE -->|No| DISABLED[503 recommendation_unavailable<br/>trace ID; no customer lookup]
+    GATE -->|Yes| SUBJECT[Authorize subject and consent / purpose]
+    SUBJECT -->|Denied| DENY
+    SUBJECT -->|Allowed| FANOUT{Authorized data reads}
     FANOUT --> PROFILE[Customer profile / stated needs]
     FANOUT --> POLICIES[Existing policies / coverage]
     FANOUT --> CLAIMS[Claim history / status as permitted]
@@ -518,6 +545,17 @@ Dense Qdrant retrieval handles semantic paraphrase; lexical/BM25 retrieval helps
 - **Contextual compression — optional:** apply before final context assembly only when evidence exceeds the token budget. Prefer extractive span selection preserving source offsets and chunk IDs; retain source chunks as authority. Avoid generated paraphrases being treated as quotes/evidence.
 - **Top-K — recommended to tune empirically:** bound dense/lexical candidates and reranker input, but choose values using recall@k and clause-level evaluation, not a generic heuristic.
 - **Deduplication — recommended:** deduplicate stable chunk IDs and near duplicates after fusion, while preserving version-, endorsement- and exception-distinct content.
+
+### Retrieval tuning and promotion protocol
+
+Maintain a frozen, versioned offline baseline using the same source corpus, ACL/effective-date filters, query set and embedding/index generation. Evaluate candidate changes (candidate K, fusion, BGE top-N, MMR and extractive compression) against:
+
+- evidence Recall@K/Context Recall for SME-labelled clauses, especially exclusions, waiting periods, exceptions and tables;
+- Precision@K, nDCG@K and MRR for ranking/usefulness, segmented by exact identifiers/terms versus semantic paraphrases;
+- citation/source-version correctness and preservation of qualifying spans;
+- retrieval, reranking and context-assembly P50/P95/P99, candidate/prompt token count, compute/provider cost and failure rate.
+
+Compare each feature to the semantic-only + BGE baseline, one change at a time where practical. Hybrid lexical retrieval is promoted only if measured exact-term retrieval improvement justifies a separately synchronized ACL/version-equivalent index and its operational cost. MMR/compression stay off by default and are promoted only if they improve measured diversity/context budget without regressing any approved critical case or citation/qualifier integrity. Select top-K/top-N at the smallest values that meet the SME-approved evidence-recall and latency/cost gates; no universal value or score threshold is prescribed. Version the query set, corpus, index, retriever/reranker settings and evaluation code; retain baseline results for rollback comparison. Failed gates prevent promotion; do not silently alter production retrieval settings.
 
 ## 11. Context Augmentation
 
@@ -552,14 +590,14 @@ Recommended citation fields: document name/ID, version/effective date, section/c
 - Validate schemas, payload sizes, attachment allowlists, rate limits and authorization at API boundaries.
 - Authenticate/authorize before history, customer, catalog or document retrieval; apply the same scope at cache reads and prompt assembly.
 - Treat user messages, conversation summaries and retrieved text as untrusted data; screen for prompt injection and never execute instructions found in evidence.
-- Minimize customer data before external model/trace boundaries. Apply approved PII detection/masking when required by data classification.
+- Minimize customer data before external model/trace boundaries. If classified PII may cross an external boundary, detect and mask it with Microsoft Presidio (reference implementation) or an approved equivalent DLP control before export; verify output and trace redaction as well.
 - Use NeMo Guardrails for configured dialogue/input/output behavior, backed by deterministic application authorization, rule, schema, provenance, grounding and citation validation.
 - Redact/minimize telemetry; use opaque IDs; control trace access, retention, residency and deletion.
 - Sensitive claim denial, disputed coverage, legal ambiguity and suitability decisions require human review where governed policy says so.
 
 ### Presidio vs NeMo Guardrails
 
-Microsoft Presidio (or an approved equivalent DLP/PII service) detects and may anonymize PII; NeMo checks configured dialogue, input/output and safety policy. They are complementary, not substitutes. Presidio is a candidate implementation, not a selected/deployed component in the current architecture. Whether it is required depends on data classification, model processing agreements and trace destinations. Define identifiers/regions, false-negative tests, masking/restoration behavior and outage policy before deployment. Neither tool is an authorization or factuality boundary.
+Microsoft Presidio is the reference PII detection/masking implementation when classified PII would otherwise cross an external model or trace boundary; an approved enterprise DLP service may replace it if it meets the same tested requirements. NeMo checks configured dialogue/input/output and safety policy. They are complementary, not substitutes. Minimize structured customer fields before constructing prompts, mask sensitive identifiers before external model/trace export, and redact traces independently. Do not restore masked identifiers inside model context; if a response requires a customer identifier, render it through an authorized application path after response validation. Test regional insurance identifiers, false negatives/positives, model usefulness after masking, trace redaction, retention/deletion, and fail-closed behavior when required controls are unavailable. Neither tool is an authorization or factuality boundary.
 
 ## Token & Cost Optimization
 
@@ -580,7 +618,19 @@ Microsoft Presidio (or an approved equivalent DLP/PII service) detects and may a
 | MMR | **Optional** | Only if duplicate-heavy results are measured and no evidence loss occurs |
 | Hybrid retrieval | **Recommended when deployed and measured** | Can reduce misses for exact terminology, but adds index synchronization/search cost |
 
-Track token usage and cost per request/workflow and stage (rewrite, embedding/query, reranker, generation, guardrail, optional judge), model, tenant/channel and outcome. Alert on anomalous cost, fan-out, input truncation, cache-scope errors and cost per successful task. A lower token count is not an optimization if it drops an exclusion or required citation.
+Track token usage, request count and provider cost per workflow and stage: query embedding, rewrite/planning, generation, embeddings for ingestion, OCR, BGE, optional evaluation and retries. Attribute by model/provider, configuration version, outcome and privacy-safe low-cardinality dimensions such as route and product class; do not use raw customer IDs as metric labels. Include unsuccessful, timed-out and retried work so the reported cost per successful workflow is complete.
+
+Enforce a model-specific hard input/output token budget before every call, including a reserved completion and safety margin. Keep a call ledger and per-route call/fan-out ceiling; honor provider RPM/TPM quotas and retry-after within the overall deadline. Set operational spend budgets and alert thresholds with finance/platform owners from measured usage; stop or shed optional work when a budget is exhausted rather than degrade grounding or silently overspend. Report spend and tokens by route, model, stage and successful outcome, including monthly aggregate and re-index batch cost.
+
+Batch ingestion embeddings when supported by provider limits; reuse embeddings only when the immutable chunk content, embedding model/version, dimensions and preprocessing configuration all match. A mismatch requires re-embedding and staged index validation, never reuse by approximate name. Keep interactive and background provider concurrency separately bounded so bulk embedding, OCR or Ragas work cannot consume unreserved interactive capacity. Use cheaper models for routing/rewrite only after the same privacy, safety and per-segment quality gates as generation; deterministic routing remains preferred. Do not add an extra LLM reasoning call merely to reduce prompt size.
+
+Alert on token/call budget exhaustion, provider throttling, retry amplification, unexpected model/config changes, cost per successful task, failed-work cost, embedding duplication and ingestion backlog. Cost reductions are accepted only after the critical evidence/citation regression set still passes.
+
+### Cache contract
+
+Caching is disabled unless a measured hot path justifies it. Default candidates are immutable public/role-scoped FAQ evidence or retrieval outputs over an approved index generation. Cache keys must include tenant and authorization scope plus every answer-affecting dimension: jurisdiction, effective/as-of date, product/document scope, active index generation, retrieval configuration and prompt/schema version where relevant. Recheck authorization on every cache read; invalidate on ACL, document/version, effective-date, index-generation or configuration changes. Redis TTL and eviction limits must be approved and tested against freshness requirements; this architecture does not prescribe numeric TTLs.
+
+Never cache customer profile/policy/claims facts, eligibility or suitability decisions as authoritative. Generated personalized responses remain uncached by default. If a measured use case requires such caching, require explicit security/business approval, scoped identity and source versions in the key, freshness enforcement, invalidation tests, and an audited bypass path. Redis outage, stale entry, missing scope or uncertain invalidation must bypass the cache and read authoritative sources when safe; otherwise return the normal safe unavailable response. Cache failure must never skip authorization or change the answer's source-of-truth.
 
 ## 15. Edge Cases & Failure Handling
 
@@ -603,7 +653,7 @@ The table gives the required response pattern: **detection → handling → fall
 | MongoDB metadata/lineage failure | Read/write errors or cross-store version mismatch | Stop publication; repair/reconcile from immutable source and staged index | Keep previous valid generation if effective; otherwise no-answer | Stale/new documents unavailable |
 | Redis cache failure/stale cache | Cache errors, TTL/invalidation or scope/version mismatch | Bypass cache; reauthorize and fetch source; invalidate suspect entries | Rebuild session context or ask user to restate it | Higher latency or lost continuity; not correctness change |
 | Agent/graph node failure | Node timeout/exception, invalid state transition, exhausted deadline | Fail node explicitly; retry only idempotent transient operation; cancel siblings | Route to safe terminal state (clarify/abstain/escalate) | Workflow incomplete; avoid success-shaped fallback |
-| Duplicate Kafka/Event Hubs event | Idempotency key already completed, replay count/checksum mismatch | Acknowledge idempotent no-op; reconcile partial stages | Conflicting checksum/non-retryable poison event to DLQ | Normally none; affected version may be delayed |
+| Duplicate Kafka event | Idempotency key already completed, replay count/checksum mismatch | Acknowledge idempotent no-op; reconcile partial stages | Conflicting checksum/non-retryable poison event to DLQ | Normally none; affected version may be delayed |
 | Partial ingestion/index publication | Expected/actual IDs/counts differ across MongoDB/Qdrant; incomplete stage state | Keep staging generation non-searchable; repair/replay idempotently | Continue prior generation only if effective; else unavailable | Fresh policy content delayed |
 | Prompt injection | Input/document screening signal, tool/scope request mismatch, unusual route | Treat as untrusted data; ignore embedded instructions; enforce auth and filters independently | Refuse unsafe request, clarify, or human review | Request denied/limited; possible reduced capability |
 | PII leakage risk | DLP/PII scan, trace redaction audit or policy classification check | Minimize/mask according to approved policy; prevent raw content trace export | Fail closed when mandatory masking/security control is unavailable | Sensitive workflow unavailable rather than exposed |
@@ -656,7 +706,7 @@ Keep immutable source documents and extraction artifacts in durable Blob storage
 
 ### Production observability
 
-OpenTelemetry with Azure Monitor/Application Insights is the operational source of truth. Record correlation IDs and opaque evidence/source/version IDs, route, model/prompt/retrieval configuration versions, per-stage latency/errors, token/cost, retries, cache outcome, index freshness, retrieval scores, no-hit/low-confidence, citation rejection, guardrail results, clarification, abstention, escalation and recommendation outcomes. Do not place raw conversation/PII/full passages in ordinary logs. Export to LangSmith only after privacy, residency, access and retention approval; export failure must not block serving.
+OpenTelemetry with Azure Monitor/Application Insights is the operational source of truth. Record correlation IDs and opaque evidence/source/version IDs, route, model/prompt/retrieval configuration versions, per-stage latency/errors, token/cost, retries, cache outcome, index freshness, retrieval scores, route confusion, no-hit/low-confidence, citation rejection, guardrail results, user correction, clarification, abstention, escalation and recommendation outcomes. Define route/product/version alert thresholds from an approved baseline and page only on actionable SLO or critical-quality breaches. Do not place raw conversation/PII/full passages in ordinary logs. Export to LangSmith only after privacy, residency, access and retention approval; export failure must not block serving.
 
 ### Offline evaluation
 
@@ -670,6 +720,14 @@ Ragas is recommended for versioned SME-reviewed evaluation sets:
 Also test deterministic authorization, current-version selection, citation resolution, structured schema, disclosures, rules and reason codes. Segment results by product, jurisdiction, channel, workflow and policy version; pin dataset/evaluator/model versions; calibrate LLM judge metrics against insurance SMEs. Do not release on a single aggregate score.
 
 For recommendations, separately regression-test rule versions, eligibility outcomes, reason codes, catalog-effective dates, no-match/insufficient-data behavior and candidate explanations against business-approved cases. Ragas does not validate deterministic suitability or rule correctness.
+
+### Release quality gates
+
+Maintain a versioned reference set owned by insurance SMEs and segmented by workflow (simple FAQ, ambiguous follow-up, personalized policy/claims Q&A, recommendation), product, jurisdiction, policy/effective version, and channel. Include material clauses, exclusions, waiting periods, endorsements, table values, conflicting/expired documents, no-hit/ambiguous questions, and rule/catalog edge cases. Each case records expected route, required evidence/citations, authorization outcome, expected deterministic rule result where applicable, and acceptable answer/abstention behavior.
+
+Before release, owners must baseline and approve per-segment thresholds for Context Recall and Precision, answer faithfulness/relevancy, citation correctness, retrieval/routing behavior, and latency/cost. Do not invent universal score cutoffs or approve from an aggregate alone. Hard gates: all deterministic authorization, current-version, citation-integrity, response-schema, disclosure, rule-version and reason-code tests pass; no known critical unsupported coverage/eligibility claim remains in the release corpus; any change fails its release gate if it regresses an approved critical case. SME approval is required to set or change score thresholds and accept a documented trade-off.
+
+In production, alert on route confusion, no-hit/low-confidence, citation rejection, correction, abstention/escalation, stale-index and rule/catalog mismatch rates by route/product/version. Use deterministic controls in the request path. Ragas/LLM-judge scoring runs offline or asynchronously on privacy-reviewed samples and is an investigation signal, not a synchronous response gate.
 
 ### Feedback and improvement
 
@@ -709,7 +767,7 @@ An authorized advisor posts to `/api/v1/recommendations` with an opaque customer
 | Multi-query generation | Optional for complex decomposable questions only | Recall may improve; fan-out, latency and noise increase |
 | LangGraph | Retain as controlled workflow | Explicit routing/state, but replay/checkpoint and node failure require controls |
 | NeMo Guardrails | Retain as configured guardrail layer | Useful dialogue safety; not authorization, PII, rule or citation validation |
-| Presidio/DLP | Optional implementation for classification-driven PII needs | Complementary to NeMo; adds latency and recognizer maintenance; not currently selected |
+| Presidio/DLP | Required when classified PII may cross an external model/trace boundary; Presidio is the reference implementation and approved DLP equivalent is acceptable | Complementary to NeMo; adds latency and recognizer maintenance; deployment and tests remain release gates |
 | Redis | Optional cache/session acceleration | Lower latency, but invalidation/scope collision risk; never authoritative |
 | MongoDB durable conversation history | Conditional on governance | Continuity/audit benefit vs sensitive retention/deletion burden |
 | Ragas | Recommended offline | Quality measurement with SME data; judge scores are estimates and add batch cost |
