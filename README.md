@@ -35,7 +35,7 @@ The Insurance AI Assistant combines:
 - guardrails and validation before final answer generation
 - citations, auditability, and governance controls
 
-This is designed as a secure production-grade AI assistant for policy and claims workflows rather than a demo-only chatbot.
+This is designed as a secure production-grade AI assistant for policy and claims workflows chatbot.
 
 ---
 
