@@ -1,988 +1,752 @@
 # RAG Architecture for Insurance AI Assistant
 
-## Overview
+## 1. Overview & Business Use Cases
 
-This document describes the Retrieval-Augmented Generation (RAG) architecture for the insurance AI assistant. The goal is to answer customer and advisor questions with high accuracy, enterprise-grade security, source-grounding, and policy-aware reasoning.
+This document describes an enterprise Retrieval-Augmented Generation (RAG) architecture for insurance customer and advisor workflows. It supports two distinct capabilities:
 
-The RAG layer is the heart of the system because insurance knowledge is mostly in long, dense, policy-heavy documents such as:
+1. **Conversational Q&A:** explain approved policy terms, coverage wording, exclusions, waiting periods, claims procedures, and related documents with source citations.
+2. **Product recommendation:** return eligible, explainable candidate products using authorized customer/policy/claims data, a product catalog, deterministic eligibility/suitability rules, and RAG evidence. Recommendations are not coverage decisions or policy contracts.
 
-- policy documents
-- terms and conditions
-- product brochures
-- claims procedures
-- FAQs
-- regulatory guidance
+The LLM interprets language and explains validated inputs; it is not a policy system of record, eligibility engine, customer database, or source of product suitability rules. Every material insurance fact must be traceable to an authorized current source or a governed rule result. Where evidence, authorization, eligibility, or policy validity cannot be established, the system clarifies, abstains, or hands off to a human.
 
-The system must not rely on the LLM to "remember" policy rules. It must retrieve the relevant evidence first, then reason over it, and then answer with citations.
+**Architecture status:** this is a target design documented for review. Named technologies, diagrams, endpoint contracts, and operational controls below do not by themselves prove implementation, benchmark, or production approval. Explicit gaps are identified rather than silently assumed.
 
----
+## 2. Enterprise RAG Architecture
 
-## Conversation History & Context Management
+### Components and responsibilities
 
-Multi-turn conversation history is a first-class input to query understanding, but it is not a substitute for authoritative policy documents or customer systems of record. Conversation memory helps resolve references and preserve continuity; every policy or coverage claim must still be verified against currently authorized, version-valid sources.
-
-### Conversation state and storage
-
-- Assign each conversation a stable opaque ID, tenant/owner scope, creation time, last activity, and retention/expiry policy.
-- Store the canonical message history in the approved conversation store with encryption at rest and in transit, access checks on every read, and audit logging. MongoDB may hold durable conversation metadata/history where approved by the enterprise data-retention policy; Redis is only an optional short-lived cache, not the source of truth.
-- Keep message roles, timestamps, turn IDs, and links to retrieved evidence and generated answers. Do not store credentials or unnecessary sensitive data in conversation memory.
-- Apply deletion, retention, legal-hold, and subject-access requirements consistently to raw turns, summaries, embeddings, caches, and trace records.
-- Scope history retrieval to the authenticated user, tenant, conversation ID, and permitted customer/policy context. Never retrieve across users or conversations merely because text is similar.
-
-### Conversation-aware query rewriting
-
-For a follow-up such as “What about the waiting period?”, the query understanding service should resolve the missing subject from the current conversation before document retrieval.
-
-1. Keep the user’s latest message unchanged as the canonical input.
-2. Load a compact session summary and retrieve a bounded set of relevant prior turns (see relevant-history retrieval below).
-3. Resolve references such as “it”, “that plan”, or “the waiting period” using recent turns and explicit customer/product context.
-4. Produce a standalone rewritten search query and structured carry-forward constraints (for example, product, coverage type, jurisdiction, policy year, and unresolved ambiguity).
-5. Validate that the rewrite preserves the user’s intent and does not broaden customer, policy, or authorization scope. Keep the original query alongside the rewrite for tracing.
-6. Run document retrieval using the rewritten query and current authorization/effective-date filters. Do not treat prior assistant statements as factual policy evidence.
-
-For example, after discussing the Health Plus policy, “What about the waiting period?” can be rewritten as “What waiting period applies under the Health Plus policy?” while retaining the original question and the policy scope from verified context.
-
-Rewriting is a query transformation, not answer generation. It should use a low-latency model or deterministic logic where suitable, return a typed result containing the original query, standalone query, resolved entities/constraints, source turn IDs, confidence, and clarification status, and have a bounded timeout. If references cannot be resolved confidently, ask a clarifying question rather than guessing.
-
-### Relevant-history retrieval
-
-- First include the most recent turns needed to preserve conversational continuity, subject to the token budget.
-- For older turns, retrieve only semantically relevant messages or compact turn summaries scoped to the same authorized conversation and subject.
-- Initial operating limit: include at most the latest four user/assistant turn pairs or the history token allocation (15% of the model context budget), whichever is reached first; retrieve no more than five older turns/summaries unless an evaluated workflow has a documented need.
-- Prefer user statements and explicit confirmed details over previous assistant-generated prose. Carry forward user-provided preferences or facts only as conversational context; verify policy/customer facts against systems of record.
-- Apply recency and relevance ranking, deduplicate overlapping turns, and exclude unrelated or superseded discussion.
-- Do not allow retrieved history to override current permissions, current customer context, or current policy/document versions.
-- If no relevant history is found, the latest question remains a standalone query; if a critical reference remains ambiguous, ask the user to clarify.
-
-### Summarization and long-conversation management
-
-- Maintain a compact rolling summary when a conversation exceeds the recent-turn budget. Summaries should capture topic, confirmed user-provided details, selected product/policy context, unresolved questions, and relevant turn IDs.
-- Clearly label summary fields by provenance: user-provided, system-of-record verified, or assistant-generated. Treat summaries as navigation/context only, never as authoritative evidence.
-- Refresh summaries from canonical turns, not from a previous summary alone; preserve links to source turns so a summary can be checked or corrected.
-- Keep a sliding window of recent turns plus retrieved relevant older turns. Do not append the complete transcript to the model prompt.
-- Start summary refresh when the recent-turn window would exceed its budget or before adding a new topic segment; enforce maximum summary tokens using the same model-specific tokenizer as prompt construction.
-- On topic change, start a new topic segment or summary scope while retaining the conversation ID; on a new conversation, do not reuse history unless explicitly requested and authorized.
-- If summary generation or storage fails, continue with the bounded recent-turn window when possible; otherwise ask the user to restate the required context.
-
-### Context-window and token-budget policy
-
-Use model-specific tokenization and configure budgets per model/version. A starting model-context budget (including reserved completion capacity) can allocate approximately:
-
-| Context element | Starting budget | Policy |
-|---|---:|---|
-| System, safety, and output instructions | 10% | Fixed and never displaced by history |
-| Latest user message and rewritten query | 10% | Always preserve the original message |
-| Relevant recent turns and summary | 15% | Select only relevant, scoped context |
-| Customer context and business rules | 15% | Minimize data; authoritative sources only |
-| Retrieved document evidence | 40% | Rank and trim to the strongest citation-ready chunks |
-| Reserved output and safety margin | 10% | Protect completion length and model/tokenizer variance |
-
-These are initial planning values, not fixed limits. Enforce a hard input-token ceiling below the model context limit after reserving output tokens, and trim in this order: unrelated older history, redundant summary details, low-ranked evidence, then nonessential customer context. Never trim safety instructions, authorization constraints, the latest user message, or citation requirements. If the remaining evidence cannot fit without losing necessary qualifications, split the workflow, retrieve a narrower evidence set, or ask a clarifying question; do not silently truncate policy clauses.
-
-### Privacy, correctness, and evaluation controls
-
-- Encrypt stored conversation data and embeddings; apply least-privilege access, retention, deletion, and audit policies.
-- Do not place sensitive raw conversation text in cache keys, metrics, or ordinary logs. Use opaque IDs and redacted/aggregated telemetry.
-- Isolate history retrieval and caches by tenant, user, conversation, and relevant authorization version. Invalidate cached context when permissions or policy scope change.
-- Defend against prompt injection contained in prior user or assistant messages. History is untrusted input and must not alter system/developer instructions or access policy.
-- Measure rewrite intent preservation, reference-resolution accuracy, correct clarification rate, history-retrieval precision, token usage, latency, and downstream retrieval/citation quality. Test ambiguous follow-ups, topic switches, stale summaries, revoked access, and very long conversations.
-
-### Conversation-aware query flow
-
-```mermaid
-flowchart TD
-    U[Latest user message] --> AUTH[Authenticate and authorize conversation access]
-    AUTH --> LOAD[Load bounded recent turns and summary]
-    LOAD --> HIST[Retrieve relevant older turns<br/>same user, tenant and conversation]
-    U --> REWRITE[Conversation-aware query rewriter]
-    LOAD --> REWRITE
-    HIST --> REWRITE
-    REWRITE --> RESOLVE{Reference resolved confidently?}
-    RESOLVE -- No --> CLARIFY[Ask a clarifying question]
-    RESOLVE -- Yes --> VALIDATE[Validate intent and scope<br/>preserve original query]
-    VALIDATE --> RETRIEVE[Search authorized current policy sources]
-    RETRIEVE --> EVIDENCE[Ranked policy evidence]
-    EVIDENCE --> ANSWER[Generate and validate grounded response]
-    ANSWER --> STORE[Persist turn, evidence links and audit metadata]
-    STORE --> SUMMARY{Summary refresh required?}
-    SUMMARY -- Yes --> UPDATE[Refresh compact provenance-aware summary]
-    SUMMARY -- No --> DONE[Conversation state ready for next turn]
-    UPDATE --> DONE
-    CLARIFY --> STORE
-```
-
-The history store and relevant-turn retrieval provide bounded conversational context; the rewriter converts a follow-up into a standalone search query while preserving scope and the original wording. The confidence gate prevents guessing when a reference is ambiguous. Policy retrieval remains a separate authoritative step, and evidence links are stored with the new turn so later history can distinguish verified sources from assistant text. Summarization is refreshed only as needed and remains traceable to canonical turns.
-
----
-
-## 1. Objectives of the RAG Layer
-
-The RAG architecture must:
-
-- retrieve policy-relevant evidence with high precision
-- filter results by product, policy version, region, coverage type, and user permissions
-- improve retrieval quality with re-ranking
-- ground answers in source documents and chunks
-- support both FAQ and policy reasoning use cases
-- resolve multi-turn follow-up questions using bounded, permission-scoped conversation history
-- reduce hallucinations and unsupported conclusions
-- support auditability and explainability for regulated workflows
-
----
-
-## 2. Major RAG Workflows
-
-The RAG lifecycle is split into three workflows so ingestion, query-time retrieval, and response generation can be scaled, secured, monitored, and recovered independently:
-
-1. **Document ingestion pipeline** prepares approved source documents and publishes versioned chunks to the search index.
-2. **Query retrieval pipeline** authenticates and scopes a request, finds relevant evidence, and returns a ranked evidence set.
-3. **Final RAG response flow** generates a constrained answer, validates it, attaches citations, and escalates when confidence or risk requires human review.
-
----
-
-## 3. RAG Design Principles
-
-### 3.1 Retrieval-first design
-The model should not answer from raw memory alone. It should retrieve evidence first and reason over it.
-
-### 3.2 Policy-aware filtering
-A customer’s answer depends on:
-
-- policy number or policy ID
-- product type
-- coverage type
-- policy effective date
-- claim type
-- region / jurisdiction
-- document version / issue date
-- user role and permission scope
-
-### 3.3 Evidence-first answering
-Every answer must map back to one or more source chunks. The final response should cite relevant policy references and claim procedures.
-
-### 3.4 Precision over recall
-For insurance content, an overly broad retrieval set causes poor answers. The system should prefer smaller, higher-quality evidence sets with good reranking.
-
----
-
-## 4. Knowledge Sources
-
-The RAG system draws on multiple sources:
-
-- insurance policy documents
-- product brochures
-- claim manuals and claim guidelines
-- terms and conditions
-- FAQs and internal knowledge articles
-- customer policy records and claims data
-- regulatory and legal references where needed
-
-These are not all treated equally. Some are internal and role-restricted. Others are public-facing or advisor-facing only.
-
-### Source classes and authority
-
-- **Unstructured evidence:** approved policy/procedure PDFs, brochures, manuals, FAQs and regulatory sources. The approved source repository is authoritative; Blob Storage retains the immutable ingestion copy.
-- **Structured facts:** customer, policy lifecycle, claims status and eligibility inputs come from their respective enterprise systems and governed rules services at request time.
-- **Derived stores:** MongoDB holds document/chunk lineage and processing/version metadata; Qdrant holds rebuildable embeddings and retrieval payloads; Redis is an ephemeral cache/session layer. None overrides source systems or approved documents.
-
----
-
-## 4.1 Document formats and extraction boundaries
-
-The ingestion design targets text PDFs, scanned PDFs, and table/form-heavy documents. Azure AI Document Intelligence is selected to combine OCR with layout, table, and form extraction; a plain text extractor would lose important relationships and page/layout provenance.
-
-| Content | Intended handling | Boundary / control |
+| Component | Responsibility | Authority / boundary |
 |---|---|---|
-| Text PDF | Extract text and layout, normalize, retain page anchors | Validate page coverage and citation offsets |
-| Scanned PDF | OCR and layout extraction via Document Intelligence | Confidence/coverage gates; quarantine poor OCR rather than indexing it as trusted evidence |
-| Tables and forms | Extract cells/structure and retain heading, row/column, page and section association | Validate table completeness and numeric/label alignment; do not flatten if it changes meaning |
-| Images, including embedded policy images | Process only when the selected Document Intelligence model/input path supports the format and task | The supported MIME/size allowlist and visual-semantic coverage are not defined here; charts, photos, handwriting, or visual damage interpretation are not guaranteed and require a separately evaluated workflow |
-| Unsupported/corrupt/encrypted files | Reject or quarantine with operator-visible reason | Do not silently publish partial extraction |
+| API gateway and FastAPI backend | Validate request shape, size and rate; authenticate; attach correlation IDs; route Q&A or recommendation requests | Does not determine customer access from user-supplied identifiers alone |
+| Conversation service | Load bounded recent history, summary and relevant same-conversation turns | Continuity only; never policy or customer truth |
+| Query understanding / router | Classify intent and select a workflow; determine whether rewrite/decomposition is warranted | Deterministic-first; low-confidence classification leads to clarification or escalation |
+| Customer context service | Fetch profile, active policies, coverage and claims facts | Authorized enterprise systems of record with source and freshness metadata |
+| Catalog service | Return current products, product attributes, and catalog version | Product catalog is an assumed integration; concrete system/API is not selected in this architecture |
+| Document ingestion pipeline | Extract, normalize, quality-check, chunk, enrich, embed, stage and publish approved documents | Original approved source remains authoritative |
+| Retrieval service | Apply trusted metadata filters, dense/optional lexical retrieval, fusion, deduplication and ranking | Qdrant is the vector index; lexical index is conditional |
+| BGE cross-encoder | Rerank a bounded candidate set | Improves relevance ordering; does not certify truth or recover missed candidates |
+| Policy / eligibility rules | Evaluate versioned deterministic business rules and produce reason codes | Rules and enterprise facts—not the LLM—decide eligibility |
+| LangGraph orchestrator | Execute conditional workflow nodes, joins, error paths and bounded model calls | Request-scoped typed state; not unrestricted autonomous agents |
+| LLM gateway | Perform query transformation or grounded response explanation where needed | Must not make authorization or binding eligibility decisions |
+| NeMo/application guardrails | Check input/output behavior and safety policy | Not a replacement for authZ, PII controls, rule evaluation, or citation validation |
+| Citation/response validator | Resolve evidence IDs and verify authorization, version, provenance and response schema | Deterministic application gate before returning an answer |
+| Observability/evaluation | OTel/Azure operational telemetry; offline Ragas and optional LangSmith workflows | Evaluation/trace outages never block serving |
 
-The exact upload format allowlist, file-size limits, password-protected-file policy, language coverage, and OCR confidence thresholds are implementation gaps and must be set in the ingestion contract. Do not describe image interpretation as supported solely because OCR/layout extraction exists.
+### Data and source-of-truth boundaries
 
----
-
-## 5. Document Ingestion Pipeline
-
-```mermaid
-flowchart TD
-    A[Admin uploads approved document] --> B[(Azure Blob Storage<br/>immutable source)]
-    B --> C[Document-created event]
-    C --> D[Event broker<br/>Event Hubs or Kafka]
-    D --> E[Airflow ingestion workflow]
-    E --> F[Azure AI Document Intelligence]
-    F --> G[OCR, layout and table extraction]
-    G --> H[Normalize text and preserve page/section provenance]
-    H --> I{Extraction and metadata quality checks}
-    I -- Pass --> J[Insurance-aware chunking]
-    I -- Fail --> X[Quarantine and operations review]
-    J --> K[Enrich chunks with version, product, jurisdiction and access metadata]
-    K --> L[Generate embeddings]
-    L --> M[(Qdrant<br/>versioned vector payloads)]
-    K --> N[(MongoDB<br/>document, chunk and processing metadata)]
-    M --> O[Index validation]
-    N --> O
-    O --> P[Mark document version searchable]
-    E -. transient processing failure .-> RETRY{Retry budget remains?}
-    RETRY -- Yes --> E
-    RETRY -- No --> DLQ[Dead-letter queue / operations review]
-```
-
-### Pipeline explanation
-
-The ingestion workflow turns an approved source file into searchable, traceable evidence. Blob Storage retains the immutable original; the event broker decouples uploads from processing bursts; and Airflow coordinates retryable, observable steps. Document Intelligence extracts OCR, layout, and table structure, while normalization and quality checks catch extraction problems before indexing. Insurance-aware chunking keeps clauses and tables interpretable, and enriched metadata supports policy, version, and access filters. Qdrant serves vector retrieval; MongoDB records document lineage, chunk metadata, and processing state. Index validation ensures a version is not exposed as searchable until its vectors and metadata are consistent. Failed or low-quality documents are quarantined or retried rather than silently published.
-
----
-
-## 6. Chunking Strategy
-
-Insurance documents are often long and clause-heavy. Therefore, simple chunking is not enough.
-
-### Recommended chunking rules
-
-- Prefer semantic chunking over arbitrary fixed-size splitting
-- Preserve section boundaries where possible
-- Keep table data and policy terms together when they belong to the same clause
-- Avoid splitting across legal definitions or exclusions if it creates ambiguity
-- Add metadata at chunk level
-- Prefer deterministic structure-aware chunking from Document Intelligence headings, paragraphs, clause IDs, table cells, page boundaries, and document hierarchy; use semantic boundary detection only where structure is absent or unreliable
-- Retain raw extracted text and stable source offsets so chunks and later compressed passages can resolve to exact page/section citations
-- Add ingestion quality gates for missing pages, low OCR confidence, broken tables, empty/oversized chunks, duplicate chunks, missing required metadata, and invalid provenance; quarantine rather than index failures
-- preserve explicit references such as “see Section 8.2” as extracted text and, where verified, normalized reference metadata; cross-document reference resolution is not currently specified as a working service
-
-### Example chunk metadata
-
-- document_id
-- version_id
-- product_type
-- policy_year
-- coverage_line
-- jurisdiction
-- section_title
-- page_number
-- source_url
-- extraction_quality_score
-- created_at
-
-### Chunk, embedding, and re-index versioning
-
-Persist document/source version, parser and normalization version, chunker version, metadata schema version, embedding model/version and dimension, and index generation ID. Do not mix incompatible embedding spaces in one collection. Stage reprocessing into a non-active generation, compare expected/actual chunk IDs and counts with MongoDB metadata, run retrieval evaluation, and activate only after consistency checks pass. Preserve the previously approved generation for rollback until retention/effective-date rules allow its removal.
-
-### Cross-document references and citation integrity
-
-Keep each chunk linked to an immutable source document/version, stable chunk ID, page, section/clause path, and character/source offsets. Preserve references to other clauses/documents during extraction; follow a reference only when the target has been resolved to an approved current source and passes the same user/tenant, jurisdiction, effective-date, and version filters. Cite every used source independently. A generic textual reference (“see Section X”) is not proof the target was retrieved or that the target is accessible. Automated reference resolution and link coverage are gaps until implemented and measured.
-
----
-
-## 7. Hybrid Retrieval Strategy
-
-Hybrid retrieval is a strong candidate for insurance documents and should be retained only with synchronized indexing and measured quality gains over the semantic-only baseline.
-
-### 7.1 Semantic search
-Semantic retrieval uses embeddings to find conceptually similar text.
-
-Use cases:
-
-- vague questions such as “what does this policy cover after hospitalization?”
-- cross-document paraphrases
-- broad contextual intent matching
-
-### 7.2 Lexical search
-Lexical search helps with exact terms and policy wording.
-
-Use cases:
-
-- clause names
-- exclusions such as “pre-existing condition”
-- policy wording like “deductible” or “waiting period”
-
-### 7.3 Metadata filtering
-This is essential in enterprise insurance contexts.
-
-Examples:
-
-- policy type = health insurance
-- region = India / United States / APAC
-- effective_date between X and Y
-- document version = latest approved version only
-- customer segment = retail / SME / corporate
-
-### 7.4 Why hybrid retrieval matters
-Insurance questions often combine vague natural language with exact policy terminology. Semantic search alone is not enough; lexical + metadata filtering increases precision.
-
-### Recommended dense + lexical strategy
-
-Retain Qdrant for dense semantic retrieval and add a lexical/BM25 retriever where the corpus and platform support it. Use both with identical authorization, product, jurisdiction, effective-date, and version filters. Merge and deduplicate candidates with a rank-fusion method such as reciprocal rank fusion before the existing BGE cross-encoder. This helps exact clause IDs, defined terms, claim codes, product names, and amounts while semantic search handles paraphrases. If no lexical backend is deployed, describe and operate the system as semantic-only rather than claiming hybrid retrieval.
-
-### Qdrant index design, scale and alternatives
-
-Qdrant is retained as the dedicated vector store because the current design needs dense semantic retrieval with payload metadata filters and a separately operated lexical retriever where required. The intended ANN index is HNSW: it avoids exhaustive vector scans at larger corpus sizes, trading exactness and memory/build work for query speed. HNSW construction/search settings (`m`, `ef_construct`, `ef`, quantization, shard/replica layout) are not specified or benchmarked here; treat them as deployment tuning parameters, not established production values. Validate recall/latency/memory on the representative insurance corpus before changing them.
-
-Index payloads must include stable document/chunk IDs and the minimum validated product, jurisdiction, effective-date, version, language and authorization attributes needed by server-built filters. Index payload fields used for filtering deliberately; every request still derives filters from authenticated scope, not from model output. Replicas/shards and snapshots are deployment choices subject to consistency, recovery, and capacity testing.
-
-| Alternative | When to compare | Trade-off against this design |
+| Data | Authoritative source | Derived or runtime store |
 |---|---|---|
-| Azure AI Search | Azure-managed lexical + vector retrieval and integrated enterprise search are priorities | May reduce separate lexical-index/fusion operations; compare feature fit, filtering semantics, ranking control, cost and portability |
-| pgvector | Vectors are modest in scale and transactional SQL joins are a strong requirement | Simpler single-store operations may come with different ANN/filtering and scale characteristics |
-| Weaviate, Milvus, Pinecone or another vector service | Managed operations, ecosystem, deployment model or existing enterprise standard favors it | Compare filter correctness, tenant isolation, backup/restore, availability, latency, total cost and migration path |
+| Policy documents, procedures, brochures, FAQs | Approved document repository | Immutable source copy and extraction artifacts in Azure Blob Storage |
+| Customer profile, policy lifecycle, claims status, coverage facts | CRM, policy administration and claims systems | Read at request time through authorized services; never inferred from conversation memory |
+| Eligibility and suitability logic | Governed rule service/catalog policy | Versioned deterministic rule result with reason codes |
+| Document/chunk lineage, source version, processing status | Source identity and approved document metadata | MongoDB metadata/lineage store |
+| Embeddings and retrieval payloads | Derived from approved document versions | Qdrant vector index; rebuildable and not a source of policy truth |
+| Session/cache data | No business authority | Redis ephemeral cache/session state with scoped keys and TTL |
+| Conversation history | Canonical conversation store only if enterprise retention/privacy permits | MongoDB persistence is conditional; Redis is not durable authority |
 
-No alternative is selected by name alone. Qdrant remains the documented choice; changing it requires a workload-specific benchmark and operational comparison. “Thousands of documents” is feasible as a design target but is not a measured capacity result. Corpus size is not enough to size the index: chunk count, vector dimensions, payload indexes, concurrency, filter selectivity and replication drive capacity.
+Cross-store version/checksum reconciliation is required before publication. Customer and policy facts do not become authoritative by being copied into MongoDB, Qdrant, Redis, prompts, or summaries.
+
+## Multi-Agent Architecture & Justification
+
+### What “multi-agent” means here
+
+This design uses **LangGraph as a supervisor-controlled workflow with specialized nodes**, some of which may use an LLM for bounded language tasks. It does not mean a collection of unconstrained autonomous agents. Authorization, customer-data access, retrieval filters, eligibility/suitability, citation checks, and response validation remain deterministic services or tools. The LLM is used only where language understanding or explanation adds value.
+
+### Why this is better than one LLM chain for insurance
+
+A single linear chain tends to apply the same steps to every question, even when the task differs. That is a poor fit for insurance, where a public policy FAQ, an ambiguous follow-up, a customer-specific claim question, and a product recommendation have different evidence sources, permissions, rules, and failure consequences.
+
+The graph makes those differences explicit:
+
+- **Specialized reasoning:** query understanding resolves intent; policy reasoning explains retrieved clauses; recommendation explanation summarizes already validated candidates. These roles have distinct inputs and output contracts.
+- **Conditional execution:** self-contained FAQs skip query rewriting and customer lookups; ambiguous follow-ups load bounded history; claims questions use the claims system; recommendations enter a separate governed workflow.
+- **Customer-context integration:** authorized profile, policy and claim reads are explicit dependencies, parallelized only when independent, then joined with source/freshness provenance before reasoning.
+- **Recommendation safety:** candidate eligibility and suitability are deterministic versioned rule evaluations; the LLM cannot create a product, change eligibility, or rank outside approved criteria.
+- **Reliability and explainability:** each node has a bounded responsibility, typed input/output, deadline and failure path. The graph can abstain when a required dependency or evidence gate fails, while traces identify which stage and evidence contributed.
+- **Maintainability:** retrieval, rules, prompts and workflow routes can be evaluated and changed independently, with regression tests scoped to the affected behavior.
+
+This separation has real value only when the workflows differ or require independently testable controls. If a request is a simple FAQ, execute the short route rather than invoking every specialist.
+
+### Specialist roles and authority boundaries
+
+Treat the roles below as **workflow responsibilities**, not nine separate autonomous LLM agents. Merge roles when they perform one deterministic function; keep a distinct node only when its input/output contract, failure behavior, or evaluation target is meaningfully different.
+
+| Proposed role | Optimized responsibility | Recommended implementation | Must not do |
+|---|---|---|---|
+| **1. Query Understanding Agent** | Classify intent, extract entities, detect ambiguity, assess complexity, and request a follow-up rewrite only when needed | One query-planning node: deterministic rules first, optional bounded classifier/rewriter for uncertain language; retain original query and confidence | Retrieve evidence, generate final answers, or broaden authenticated scope |
+| **2. Domain Routing Agent** | Select FAQ, policy, claim-status, eligibility, or recommendation workflow | Merge with query understanding into the same router/supervisor decision; route to typed tools/subgraphs | Perform business reasoning or answer the user |
+| **3. Customer Context Agent** | Fetch required profile, existing policies, coverage and claim facts with source/freshness provenance | Authorized deterministic enterprise API service/tool; parallelize only independent reads after authorization | Infer customer facts from conversation/RAG, or decide eligibility |
+| **4. Retrieval Agent** | Build the search request, apply trusted metadata filters, call Qdrant and optional synchronized lexical retrieval, fuse/deduplicate results | Constrained retrieval service/tool, not an autonomous agent; filters come from authenticated scope and trusted metadata | Remove ACL/version filters, decide policy meaning, or cite unretrieved sources |
+| **5. Re-ranking Agent/Node** | Rerank a bounded candidate set and expose scores/evidence IDs | BGE cross-encoder inference stage within the retrieval pipeline; separate graph node only if independently scaled, timed, or monitored | Generate natural-language answers or certify policy correctness |
+| **6. Policy Reasoning Agent** | Explain validated clauses/conditions and identify unresolved conflicts | Separate deterministic rule evaluation from optional constrained LLM evidence synthesis. Rules decide governed eligibility; LLM may explain cited evidence and reason codes | Invent missing policy information, override source terms/rules, or make unsupported binding coverage/claim decisions |
+| **7. Recommendation Agent** | Form candidate recommendations from authorized facts, catalog and approved criteria | Deterministic recommendation workflow: validate inputs/catalog, run versioned eligibility/suitability rules, select eligible candidates; optional LLM explanation only afterward | Independently determine regulatory/business eligibility, invent products, or rank outside approved criteria |
+| **8. Response Generation Agent** | Present validated facts, evidence and outcomes clearly with citations/disclosures | One shared structured generation stage for Q&A or recommendation explanation when natural-language synthesis is useful; deterministic templates may handle simpler outcomes | Introduce unsupported facts, alter rule outcomes, or fabricate citations |
+| **9. Guardrail/Validation Agent** | Enforce safety, prompt-injection handling, PII policy, grounding, citation, schema and response constraints | Split by control type: NeMo/application checks for configured dialogue safety; approved PII/DLP detector where required; deterministic authorization, provenance, rules and citation validators | Rewrite business logic, make policy decisions, or serve as the sole security/factuality control |
+
+#### Why these roles are optimized
+
+- **Merge query understanding and domain routing:** they consume the same request and produce one typed route/plan; separate agents would add hand-offs and potentially duplicate classification.
+- **Keep retrieval and BGE ranking as stages, not agents:** retrieval is a constrained data operation; BGE is a ranking inference step. A separate ranking agent would add orchestration/token cost without adding decision authority.
+- **Separate policy evidence synthesis from rule decisions:** retrieved text supports explanation; deterministic governed rules produce eligibility outcomes. They must not be collapsed into an LLM “policy decision” agent.
+- **Keep recommendation distinct from Q&A, but not LLM-led:** recommendation has unique catalog, suitability, candidate-selection and disclosure controls. Its eligibility/candidate logic is deterministic; only the explanation may use an LLM.
+- **Combine final response generation across workflows where practical:** one structured generator can render validated outcomes with workflow-specific schemas. Do not add an extra generation agent after an answer already exists.
+- **Decompose guardrails by control owner:** NeMo does not reliably replace PII detection, authorization, or citation validation; separate deterministic controls avoid treating a single “guardrail agent” as a catch-all.
+
+Accordingly, the graph has a supervisor, conditional workflow nodes/subgraphs, deterministic services, and only a small number of bounded language-model calls. A simple FAQ should take a short direct path; a multi-step recommendation uses more nodes because its distinct data and rule gates justify the complexity.
+
+### LangGraph state and execution
+
+Use a request-scoped typed state containing correlation/trace ID, authenticated scope, workflow type, original query, bounded history references, routing decision/confidence, validated customer facts and freshness, evidence IDs/source versions, catalog/rule versions, deadline/retry budget, and final status. Pass immutable source references between nodes where possible; do not place raw unbounded transcripts or global cross-request memory in graph state. Durable checkpoint storage, encryption, retention and replay policy are not selected; keep persistence disabled until those controls are approved.
 
 ```mermaid
 flowchart TD
-    QUERY[Authorized query and trusted scope] --> FILTER[Build ACL, version, date and product filters]
-    FILTER --> HNSW[Qdrant HNSW ANN search]
-    FILTER --> LEX[Optional synchronized BM25 search]
-    HNSW --> FUSE[Rank fusion and deduplication]
+    START[Request] --> API[Validate request]
+    API --> AUTH{Authorize scope?}
+    AUTH -->|No| DENY[Generic denial]
+    AUTH -->|Yes| SUPERVISOR[LangGraph supervisor<br/>typed request state and deadline]
+    SUPERVISOR --> ROUTE{Intent and confidence}
+    ROUTE -->|Unclear| CLARIFY[Clarification]
+    ROUTE -->|Q&A| QNA[Q&A subgraph]
+    ROUTE -->|Recommendation| REC[Recommendation subgraph]
+
+    subgraph QA[Conditional Q&A workflow]
+        QNA --> HISTORY{Follow-up needs context?}
+        HISTORY -->|Yes| REWRITE[Bounded history and query rewrite]
+        HISTORY -->|No| QUERY[Use original query]
+        REWRITE -->|Unresolved| CLARIFY
+        REWRITE -->|Resolved, scope preserved| QUERY
+        QUERY --> LOOKUP{Customer facts required?}
+        LOOKUP -->|Yes| CUSTOMER[Authorized customer service]
+        LOOKUP -->|No| RETRIEVAL[Filtered retrieval service]
+        CUSTOMER --> RETRIEVAL
+        RETRIEVAL --> EVIDENCE{Current, authorized evidence sufficient?}
+        EVIDENCE -->|No| ABSTAIN[Abstain or human review]
+        EVIDENCE -->|Yes| POLICY[Constrained policy explanation]
+        POLICY --> SYNTHESIS[Structured response synthesis]
+    end
+
+    subgraph RECOMMENDATION[Governed recommendation workflow]
+        REC --> INPUTS[Parallel authorized reads:<br/>profile, policies, claims, catalog]
+        INPUTS --> DATAGATE{Complete and fresh?}
+        DATAGATE -->|No| INSUFFICIENT[Insufficient data / advisor]
+        DATAGATE -->|Yes| RULES[Deterministic versioned<br/>eligibility and suitability rules]
+        RULES --> CANDIDATES{Eligible candidates?}
+        CANDIDATES -->|No| NOMATCH[No match with reason codes]
+        CANDIDATES -->|Yes| PRODUCTRAG[Retrieve current product evidence]
+        PRODUCTRAG --> RECOMMEND[Explain validated candidates<br/>optional constrained LLM]
+        RECOMMEND --> SYNTHESIS
+    end
+
+    SYNTHESIS --> VALIDATE[Deterministic schema, provenance,<br/>citation and disclosure validation]
+    VALIDATE -->|Pass| DONE[Validated response]
+    VALIDATE -->|Fail / conflict / high risk| ABSTAIN
+```
+
+### Trade-offs and controls
+
+Compared with a single chain, a graph adds routing/state management, node contracts, partial-failure handling and more integration tests. It can also increase token cost if every node is implemented as an LLM call. Control that cost by making routine nodes deterministic, invoking rewrite/classification only when needed, sharing validated evidence rather than repeating retrieval, parallelizing only independent authorized reads, bounding retries/deadlines, and using a single final explanation call where possible.
+
+Measure graph-level and per-node latency, model calls/tokens, route accuracy, tool failures, evidence/citation validation, escalation and recommendation outcomes. Release changes through route-specific regression tests and SME-reviewed evaluation. If graph orchestration provides no measurable separation, conditionality or control benefit for a simple workflow, use a direct service path rather than forcing it through a multi-agent graph.
+
+## 3. High-Level Architecture Diagram
+
+```mermaid
+flowchart TD
+    USER[Customer or advisor] --> API[API gateway / FastAPI]
+    API --> AUTH[Authenticate, authorize and validate]
+    AUTH --> ROUTER{Q&A or recommendation?}
+    ROUTER -->|Conversational Q&A| QNA[Q&A workflow]
+    ROUTER -->|Product recommendation| REC[Recommendation workflow]
+
+    QNA --> HIST[Bounded conversation context]
+    HIST --> UNDERSTAND[Query understanding and conditional rewrite]
+    UNDERSTAND --> CUSTOMER[Authorized customer context when needed]
+    UNDERSTAND --> RETRIEVE[Policy/document retrieval]
+    CUSTOMER --> ASSEMBLE[Typed context assembly]
+    RETRIEVE --> ASSEMBLE
+    ASSEMBLE --> LLM[Grounded generation]
+    LLM --> VALIDATE[Guardrail, provenance, citation and schema checks]
+    VALIDATE --> RESPONSE[Answer, clarification, abstention or handoff]
+
+    REC --> FACTS[Customer, policy and claims systems]
+    REC --> CATALOG[Product catalog]
+    FACTS --> RULES[Versioned eligibility / suitability rules]
+    CATALOG --> RULES
+    RULES --> REC_EVIDENCE[Retrieve approved product/policy evidence]
+    REC_EVIDENCE --> EXPLAIN[Explain validated candidates]
+    RULES --> EXPLAIN
+    EXPLAIN --> REC_VALIDATE[Validate candidate IDs, rules and citations]
+    REC_VALIDATE --> RESPONSE
+
+    DOC[Approved source documents] --> INGEST[Ingestion and quality gates]
+    INGEST --> BLOB[(Blob: immutable originals)]
+    INGEST --> META[(MongoDB: lineage)]
+    INGEST --> QDRANT[(Qdrant: derived vectors)]
+    RETRIEVE --> QDRANT
+    TELEMETRY[OTel / Azure Monitor] -. operational telemetry .-> API
+    TELEMETRY -. optional approved traces .-> LANGSMITH[LangSmith optional]
+    GOLD[SME-reviewed set] --> RAGAS[Ragas offline evaluation]
+```
+
+The diagram shows separate answer and recommendation paths. They share document evidence, authorization, orchestration, guardrails and telemetry where appropriate, but product eligibility is evaluated by deterministic business rules and an authoritative catalog, not by general Q&A generation.
+
+## 4. Document Ingestion & Indexing
+
+### Formats and extraction
+
+The architecture targets text PDFs, scanned PDFs, and table/form-heavy insurance documents. Azure AI Document Intelligence is selected for OCR and layout-aware extraction so headings, page locations, tables and form structure can be preserved more faithfully than by plain text extraction alone.
+
+| Input | Intended processing | Control / boundary |
+|---|---|---|
+| Text PDF | Extract text/layout; retain page and section anchors | Check page coverage, reading order and citation offsets |
+| Scanned PDF | OCR plus layout extraction | Gate on confidence and completeness; quarantine poor scans |
+| Tables/forms | Extract structure and cell/field relationships | Verify row/column and label/value integrity; do not flatten material qualifications |
+| Images/charts/handwriting | Only where the configured Document Intelligence model/input path supports the task | General visual interpretation is not guaranteed; no VLM is enabled by default |
+| Corrupt, encrypted, unsupported or oversized input | Reject or quarantine with a visible reason | Exact allowlist, file/page limits, language support and OCR thresholds are implementation decisions still required |
+
+Document Intelligence extracts content; it does not decide policy meaning, eligibility, or general visual semantics. A concrete image/chart workflow would require a separate benchmark, evidence/citation design and human-review policy.
+
+### Structure-aware chunking and metadata
+
+Use deterministic structure-aware chunks aligned to document hierarchy: headings, clause IDs, definitions, exclusions, tables, page boundaries and related qualifications. Use semantic-boundary detection only when document structure is absent or unreliable. Avoid splitting an exclusion from its exception or table value from its heading. Preserve raw normalized text and stable source offsets.
+
+Required chunk metadata should include document ID, immutable source/version ID, chunk ID, page, section/clause path, product, coverage line, jurisdiction, effective interval, language, access labels, extraction quality, parser/chunker/schema version, embedding model/version/dimensions, and index generation. ACL attributes must come from trusted sources, not LLM inference.
+
+Before embedding/indexing, validate page coverage, extraction confidence, table integrity, empty/oversized chunks, duplicate chunks, required metadata and citation anchors. Quarantine failures and expose their status to operators.
+
+### Embeddings, versioning and publication
+
+Generate embeddings with the selected, versioned embedding model and record model/version, dimensions, normalization assumptions, source hash and chunker version. Do not mix incompatible embedding spaces. Re-indexing after a source, parser, chunker, metadata or embedding change is staged:
+
+1. Build a non-active generation from immutable source artifacts.
+2. Reconcile expected and actual chunk IDs/counts/versions in MongoDB and Qdrant.
+3. Run retrieval and citation regression evaluations.
+4. Activate only after consistency and quality gates pass.
+5. Keep the previous generation available for rollback while its retention/effective-date policy permits.
+
+### Ingestion Pipeline Diagram
+
+```mermaid
+flowchart TD
+    ADMIN[Authorized document owner] --> UPLOAD[Upload approved document]
+    UPLOAD --> BLOB[(Blob: immutable source)]
+    BLOB --> EVENT[Document event]
+    EVENT --> BROKER[One selected broker<br/>Kafka or Event Hubs]
+    BROKER --> AIRFLOW[Airflow workflow]
+    AIRFLOW --> DI[Azure AI Document Intelligence]
+    DI --> NORMALIZE[Normalize text, layout, tables and page anchors]
+    NORMALIZE --> QUALITY{Extraction and metadata quality gates}
+    QUALITY -->|Fail| QUARANTINE[Quarantine and operations review]
+    QUALITY -->|Pass| CHUNK[Structure-aware chunking]
+    CHUNK --> META[Metadata, provenance and version enrichment]
+    META --> EMBED[Versioned embeddings]
+    META --> MONGO[(MongoDB lineage and job state)]
+    EMBED --> QDRANT[(Staged Qdrant generation)]
+    MONGO --> CHECK[Reconcile IDs, counts and versions]
+    QDRANT --> CHECK
+    CHECK -->|Pass| ACTIVE[Activate approved version]
+    CHECK -->|Fail| REPAIR[Idempotent retry or rebuild]
+    BROKER -. transient retries exhausted .-> DLQ[Dead-letter queue / operator replay]
+```
+
+The broker decouples upload bursts from workers; Airflow coordinates durable stages; workers may process independent documents concurrently within service quotas. Treat broker delivery as at-least-once, not exactly-once. Use stable document/checksum/version/pipeline idempotency keys, idempotent stage writes and explicit dead-letter replay.
+
+### Cross-document references and citations
+
+Preserve references such as “see Section 8.2” in extracted text with source page/section anchors. Follow a reference only when its target is resolved to an approved current document and passes identical authorization, jurisdiction, effective-date and version filters. Cite each source separately. Automated cross-document link extraction/resolution and completeness measurement are not specified as implemented capabilities.
+
+Thousands of source documents are an intended target, not a measured capacity result. Chunk count, vector dimensions, payload indexes, concurrency, quotas, re-index overlap, and recovery capacity must be benchmarked before committing throughput SLOs.
+
+## 5. Query/Retrieval Pipeline
+
+### Retrieval sequence
+
+1. Validate request; authenticate and resolve tenant/user/customer scope before accessing history or customer records.
+2. Classify intent/domain deterministically first. Route claims status to the claims system; policy questions to approved policy evidence.
+3. For self-contained queries, retrieve directly. Rewrite only ambiguous follow-ups; decompose only complex multi-facet questions.
+4. Fetch only required authorized customer context and construct trusted ACL, product, jurisdiction, effective-date and version filters.
+5. Query Qdrant dense ANN search; add BM25/lexical retrieval only if a synchronized, ACL-equivalent index is deployed.
+6. Fuse and deduplicate candidates; apply optional MMR only when duplicate-heavy retrieval is measured and evaluation shows no loss of complementary clauses.
+7. Rerank a bounded candidate set with the existing BGE cross-encoder.
+8. Apply an evidence relevance/version/permission gate. If long passages exceed context budget, optionally select extractive spans with source offsets; preserve the original chunk as authority.
+9. Return ranked evidence with stable IDs, provenance and confidence indicators; no evidence or low confidence routes to clarification, abstention or human review.
+
+### Qdrant, filtering and alternatives
+
+Qdrant is the selected vector store for dense semantic retrieval with metadata payload filters. HNSW is the intended approximate-nearest-neighbor family: it trades exact exhaustive search for lower-latency search at scale, with memory/build/recall trade-offs. HNSW `m`, `ef_construct`, query `ef`, quantization, payload indexes, shard/replica topology and recall/latency targets are not selected or benchmarked. Tune against representative corpus recall@k, p95 latency, memory and filter selectivity.
+
+Filters must be built from authenticated scope and trusted metadata, never model output. Index only needed validated payload fields. Qdrant is a derived retrieval index and cannot prove source authority or policy correctness.
+
+Azure AI Search may reduce separate lexical/vector operations; pgvector may suit smaller SQL-centric workloads; Weaviate, Milvus, Pinecone or other services may fit an enterprise standard. Compare ACL/filter semantics, tenant isolation, freshness, backups/restore, availability, latency and total cost before switching. No current benchmark justifies replacing Qdrant.
+
+### Query Retrieval Pipeline Diagram
+
+```mermaid
+flowchart TD
+    USER[User query] --> API[Authenticated API]
+    API --> AUTH[Resolve tenant, user and access scope]
+    AUTH --> CLASSIFY[Query intent and complexity]
+    CLASSIFY --> ROUTE{Query shape}
+    ROUTE -->|Self-contained| DIRECT[Use original query]
+    ROUTE -->|Ambiguous follow-up| HISTORY[Load bounded authorized history]
+    HISTORY --> REWRITE[Conditional query rewrite]
+    REWRITE --> RESOLVE{Intent and scope preserved?}
+    RESOLVE -->|No / uncertain| CLARIFY[Ask a clarifying question]
+    RESOLVE -->|Yes| SEARCHQ[Standalone query plus original for audit]
+    ROUTE -->|Complex facets| MULTI[Capped optional decomposition]
+    DIRECT --> FILTER[Build trusted ACL/version/date filters]
+    SEARCHQ --> FILTER
+    MULTI --> FILTER
+    FILTER --> DENSE[Qdrant dense HNSW retrieval]
+    FILTER --> LEX[Optional synchronized BM25 retrieval]
+    DENSE --> FUSE[Rank fusion and deduplication]
     LEX --> FUSE
-    FUSE --> BGE[BGE cross-encoder reranking]
-    BGE --> VALID[Validate source version, ACL and provenance]
-    VALID -->|Pass| CONTEXT[Evidence with stable citation IDs]
-    VALID -->|Fail| ABSTAIN[No-answer or review]
-    HNSW -->|Unavailable| RETRY[Bounded retry / circuit breaker]
-    RETRY -->|Exhausted| ABSTAIN
+    FUSE --> MMRGATE{Duplicate-heavy and evaluated?}
+    MMRGATE -->|Yes| MMR[Conservative optional MMR]
+    MMRGATE -->|No| RERANK[BGE cross-encoder]
+    MMR --> RERANK
+    RERANK --> GATE[ACL, effective version and relevance gate]
+    GATE -->|Pass| COMPRESSION{Context too large?}
+    COMPRESSION -->|Yes, if evaluated| COMPRESS[Optional extractive span selection]
+    COMPRESSION -->|No| EVIDENCE[Evidence IDs, scores and source offsets]
+    COMPRESS --> EVIDENCE
+    GATE -->|No / low confidence| SAFE[No-answer, clarify or human review]
+    DENSE -. dependency failure .-> RETRY[Bounded retry / circuit breaker]
+    RETRY -->|Exhausted| SAFE
 ```
 
-### Query routing and retrieval expansion policy
+## 6. Conversation & Memory
 
-- **Self-contained simple FAQ:** direct retrieval; no query-rewrite or multi-query LLM call.
-- **Ambiguous follow-up/pronoun:** conversation-aware rewriting from the bounded history defined above; ask clarification below the resolution-confidence threshold.
-- **Complex multi-facet comparison or compound claim question:** optional capped multi-query decomposition, only when a planner determines distinct facets need separate evidence. Preserve the same ACL and document-version filters for each subquery, then fuse and deduplicate.
-- **Policy query:** route to policy/product corpus with effective-date and jurisdiction filters.
-- **Claim query:** obtain claim status from the claims system of record and retrieve claim procedures/policy clauses separately; do not answer claim status from documents.
-- **Uncertain domain:** use deterministic routing rules or a low-cost classifier with confidence; clarify or escalate instead of broad unrestricted search.
+Conversation history is first-class **continuity context**, not policy evidence or authoritative customer memory. Store canonical turns only in an approved conversation store under encryption, retention/deletion, legal-hold, access and audit controls. MongoDB persistence is governance-dependent; Redis is an optional short-lived cache. Never retrieve history across user, tenant or conversation boundaries.
 
-Multi-query is not the default query expansion method. It can increase candidate volume and latency; cap the number of subqueries and measure recall gain against precision and cost.
+### Follow-up query rewriting
 
----
+For “What about the waiting period?”:
 
-## 8. Re-ranking Layer
+1. Preserve the canonical latest user text.
+2. Load a bounded recent-turn window and compact summary; retrieve relevant older turns only from the authorized conversation.
+3. Resolve the missing product/subject from user-confirmed context, but verify customer/policy facts from current systems.
+4. Emit a typed standalone query, resolved entities/constraints, source turn IDs, confidence and ambiguity status.
+5. Verify intent and access scope did not widen. Keep original and rewritten query for privacy-governed audit.
+6. Clarify rather than guess when multiple antecedents are plausible.
 
-After retrieval, the system should rerank candidate chunks to keep only the strongest evidence.
+Do not call an LLM rewriter for self-contained questions. Rewriting transforms a query; it does not answer it.
 
-### Recommended approach
+### Long conversations and token bounds
 
-- Use a cross-encoder model such as BGE cross-encoder or a comparable reranker
-- Rank top-k chunks based on relevance to the query and customer context
-- Use metadata weighting as part of the ranker decision
+- Keep the latest relevant turns up to the lesser of four user/assistant turn pairs or 15% of the model context budget as an initial tunable ceiling.
+- Retrieve at most five older relevant turns/summaries by default; change only after evaluation.
+- Maintain a compact rolling summary when the recent window would exceed budget. Build it from canonical turns, label provenance (user-provided, system-verified, assistant-generated), keep source turn IDs, and refresh rather than recursively summarizing only summaries.
+- On summary failure, use the bounded recent window; if essential context is missing, ask the user to restate it.
+- Treat history and summaries as untrusted context. They cannot override current authorization, current policy versions, customer systems, or rules.
 
-### Why reranking is necessary
+Starting model-context budget is a planning point, not a fixed threshold: system/safety/output instructions 10%; latest message/query 10%; history/summary 15%; customer/rule context 15%; evidence 40%; completion reserve/safety margin 10%. Use the selected model tokenizer and a hard input budget below the context limit. Trim unrelated old history first, redundant summary second, then low-ranked evidence; never silently trim safety instructions, current request, required qualifiers or citations.
 
-Naive vector search often retrieves many nearby but irrelevant chunks. Re-ranking reduces noise and dramatically improves answer quality for legal and policy content.
+## 7. Customer Context
 
-### MMR and contextual compression
+Customer context is fetched through authorized service calls to CRM, policy administration, claims and governed rules. Request only fields required by the specific workflow and attach source, retrieval time/freshness, policy/version, and authorization provenance.
 
-- **MMR:** Optional, not a default extra stage. Apply conservatively between candidate fusion and BGE only when evaluation shows duplicate-heavy results. It reduces near-duplicates but can remove complementary clauses, exceptions, or repeated wording that is legally meaningful.
-- **Contextual compression:** Optional after BGE ranking and before final context assembly when long chunks exceed the token budget. Prefer extractive span selection with original chunk IDs and source offsets. Retain the source chunk as the authority and validate that conditions, exceptions, amounts, and qualifiers remain available. Avoid LLM-generated summaries as evidence.
-- **BGE:** Retain as the primary relevance reranker. It complements dense/lexical retrieval and optional diversity; it cannot recover missed candidates or certify policy correctness.
+- Customer profile, active policies, coverage and claims facts are not derived from LLM memory, old assistant messages, Qdrant, or a stale cache.
+- Check authorization before retrieval and before prompt assembly; validate freshness and response schema.
+- Keep claim status separate from claims procedure/policy evidence: the former comes from claims system of record, the latter may come from RAG.
+- Eligibility and suitability are evaluated by deterministic, versioned rules using validated customer facts and current catalog data.
+- If a required source is unavailable or stale beyond its approved freshness window, do not return a customer-specific determination.
 
-### Query Retrieval Pipeline
+The exact customer APIs, fields, freshness SLAs, consent/data-purpose checks and product-catalog service are not selected in this architecture; they must be defined by integration and data-governance owners.
 
-```mermaid
-flowchart TD
-    U[Customer or advisor query] --> API[Authenticated assistant API]
-    API --> ACL[Authorize user and resolve tenant / customer scope]
-    ACL --> QN[Classify intent and query complexity]
-    QN --> ROUTE{Self-contained, ambiguous,<br/>or complex query?}
-    ROUTE -- Self-contained --> DIRECT[Keep original query]
-    ROUTE -- Ambiguous follow-up --> HISTORY[Load bounded recent turns and summary]
-    ROUTE -- Ambiguous follow-up --> HISTRET[Retrieve relevant older turns<br/>same authorized conversation]
-    HISTORY --> REWRITE[Conditional conversation-aware rewrite]
-    HISTRET --> REWRITE
-    ROUTE -- Complex multi-facet --> MULTI[Optional capped multi-query decomposition]
-    REWRITE --> RESOLVE{Follow-up reference resolved?}
-    RESOLVE -- No --> CLARIFY[Ask for clarification]
-    RESOLVE -- Yes --> STANDALONE[Create standalone query<br/>retain original for audit]
-    DIRECT --> SEARCHREQ[Authorized retrieval request]
-    STANDALONE --> SEARCHREQ
-    MULTI --> SEARCHREQ
-    SEARCHREQ --> CTX[Customer Context Service]
-    CTX --> SYS[Policy / claims systems of record]
-    CTX --> FILTER[Build metadata and effective-date filters]
-    ACL --> FILTER
-    SEARCHREQ --> CACHE{Authorized retrieval cache hit?}
-    CACHE -- Yes --> CACHED[Cached final candidate set]
-    CACHE -- No --> SEARCH[Run hybrid retrieval]
-    FILTER --> SEARCH
-    SEARCH --> HEALTH{Search services healthy?}
-    HEALTH -- Yes --> DENSE[Dense semantic search]
-    HEALTH -- Yes --> LEX[Lexical search for exact terms]
-    HEALTH -- No --> RETRY{Retry budget remains?}
-    RETRY -- Yes --> BACKOFF[Bounded backoff]
-    BACKOFF --> SEARCH
-    RETRY -- No --> UNAVAILABLE[Retrieval unavailable]
-    UNAVAILABLE --> ESC[No-answer or human-review path]
-    DENSE --> FUSE[Merge and deduplicate candidates]
-    LEX --> FUSE
-    FUSE --> DIVERSITY{Duplicate-heavy candidates?}
-    DIVERSITY -- Yes, if evaluated --> MMR[Conservative MMR]
-    DIVERSITY -- No --> RANK[Cross-encoder reranker]
-    MMR --> RANK
-    RANK --> GATE
-    CACHED --> GATE
-    GATE{Access, version and relevance checks} -- Pass --> SIZE{Evidence exceeds context budget?}
-    GATE -- Fail / low confidence --> ESC[No-answer or human-review path]
-    SIZE -- Yes --> COMPRESS[Optional extractive compression]
-    SIZE -- No --> EVID[Ranked evidence chunks]
-    COMPRESS --> EVID
-    EVID --> TRACE[Record retrieval trace and scores]
-    ESC --> TRACE
-    CLARIFY --> TRACE
-    QDRANT[(Qdrant)] --> DENSE
-    LEXIDX[(Lexical index, if deployed)] --> LEX
-    REDIS[(Redis, optional cache)] --> CACHE
-    TRACE --> NEXT[Pass evidence or escalation status to response flow]
+## 8. Q&A Flow
+
+### Conversational Q&A sequence
+
+```text
+User
+→ API validation and authorization
+→ Query understanding / domain route
+→ Bounded conversation context (only for continuity or follow-up resolution)
+→ Authorized customer context (only when the question requires it)
+→ Policy/document retrieval with ACL/version filters
+→ Candidate fusion, deduplication and BGE reranking
+→ Evidence sufficiency and policy reasoning
+→ Typed context assembly
+→ LLM explanation
+→ Guardrails and deterministic validation
+→ Citation resolution
+→ Answer, clarification, abstention or human handoff
 ```
 
-The query pipeline authenticates the caller and resolves customer and tenant scope before any conversation history is loaded. Self-contained questions go directly to retrieval; only ambiguous follow-ups load a bounded recent-turn window, compact summary, and scoped relevant-history before conversation-aware rewriting. If the reference remains ambiguous, the system asks for clarification instead of guessing. The original wording is retained for audit. Customer context produces metadata filters for product, jurisdiction, effective date, document version, and permissions. Dense search in Qdrant handles paraphrases, while an optional lexical index finds exact clause terms; candidate fusion, optional measured diversity filtering, and cross-encoder reranking improve precision. Access, version, and relevance gates prevent unauthorized or stale evidence from proceeding. Redis can reduce repeat-query latency only when the cache key includes authorization, conversation, and policy scope. Retrieval scores and source identifiers are traced for evaluation and audit; weak or disallowed evidence leads to an explicit no-answer or review status rather than forced generation.
-
----
-
-## 9. Context Assembly
-
-Once the relevant chunks are selected, the system assembles a grounded context for the model.
-
-### Context may include
-
-- the standalone rewritten query plus the original latest user message
-- a compact conversation summary and only the relevant prior turns needed for continuity
-- provenance labels for remembered details (user-provided, system-verified, or assistant-generated)
-- top retrieved chunks
-- top metadata-filtered chunks
-- customer policy details
-- claim-specific context
-- separately identified business-rule outputs and reason codes
-- answer-style rules and formatting instructions
-
-Conversation history is context for resolving references and maintaining continuity, not evidence for policy claims. Do not pass the complete transcript. The prompt builder enforces the model-specific token budget defined in [Conversation History & Context Management](#conversation-history--context-management), preserving system/safety instructions, the current question, required policy qualifications, and citations before optional older history.
-
-### Context trust and priority
-
-Pass each source as a distinct typed block, not as an undifferentiated transcript:
-
-1. **System/security instructions:** immutable policy, safety, access boundaries, and response contract.
-2. **Current user request:** original message plus a validated standalone rewrite; user intent never grants data access.
-3. **Customer-specific facts:** fresh, authorized facts from customer/policy/claims systems of record, with timestamps and provenance.
-4. **Business-rule results:** versioned rule output and reason codes from the governed deterministic rule service.
-5. **Retrieved policy evidence:** approved document version, jurisdiction/effective date, exact chunk and citation metadata.
-6. **Conversation history:** selected relevant turns and summary for reference resolution only; assistant text is untrusted continuity context, not a source of policy or customer truth.
-7. **Output format:** structured answer fields and citation requirements.
-
-This ordering is a prompt-layout/trust boundary, not an instruction to silently settle contradictions. If authoritative policy text, customer data, and a business rule conflict or have incompatible effective dates, stop and clarify/escalate. Do not let conversation memory override systems of record, active policy documents, authorization, or governed rule results.
-
-The response contract should distinguish:
-
-- `policy_facts`: statements supported by approved retrieved policy chunks and citations
-- `customer_facts`: customer-specific facts from authorized systems of record, with freshness/provenance
-- `business_rule_results`: eligibility or workflow outcomes from the versioned rule service, with reason codes
-- `explanation_or_recommendation`: model-generated explanation only, bounded by the preceding evidence and approved suitability constraints
-
-Never present model-generated explanation as a contractual fact or imply that a recommendation is a binding coverage/eligibility decision.
-
-### Example of context payload
-
-```json
-{
-  "original_query": "What about the waiting period?",
-  "rewritten_query": "What waiting period applies under the Health Plus policy?",
-  "conversation_context": {
-    "summary": "User is asking about Health Plus inpatient coverage.",
-    "relevant_turn_ids": ["turn-18", "turn-19"],
-    "authority": "continuity-only"
-  },
-  "customer_facts": {
-    "policy_id": "POL-1245",
-    "product": "Health Plus",
-    "coverage_type": "inpatient",
-    "verified_at": "2025-01-01T00:00:00Z",
-    "source": "policy-system"
-  },
-  "business_rule_results": [],
-  "resolved_constraints": {
-    "jurisdiction": "authorized policy jurisdiction",
-    "policy_version": "current version for effective date"
-  },
-  "retrieved_chunks": [
-    {
-      "doc_id": "policy-health-2025",
-      "chunk_id": "c-341",
-      "evidence_id": "ev-982",
-      "score": 0.94,
-      "section": "Waiting Periods",
-      "page": 14,
-      "version": "2025.01"
-    }
-  ]
-}
-```
-
-The example is illustrative; production payloads should use typed schemas, protect identifiers, and avoid copying redundant fields when building the model prompt.
-
----
-
-## 10. Grounded Answer Generation
-
-The LLM should answer only from the retrieved context and policy rules. It should be explicitly instructed to:
-
-- answer conservatively
-- cite supporting evidence
-- mention uncertainty where policy language is unclear
-- avoid assuming customer coverage without evidence
-- produce structured responses when needed
-- label policy facts, customer-specific facts, deterministic rule outcomes, and model-generated explanations separately
-- emit only citation IDs supplied in the evidence bundle; citation URLs/page labels are resolved and validated server-side
-
-### Example answer behavior
-
-- “According to Section 3.2 of the Health Plus policy, emergency inpatient treatment is covered when admitted within 24 hours of an accident.”
-- “This answer is based on the latest policy version effective 1 Jan 2025.”
-
-### Final RAG Response Flow
-
-```mermaid
-flowchart TD
-    START[Ranked evidence + customer context<br/>rewritten query + selected history] --> CHECK{Evidence sufficient and permitted?}
-    CHECK -- No --> SAFE[Return limitation or request clarification]
-    CHECK -- Escalation required --> HUMAN[Route to advisor / human review]
-    CHECK -- Yes --> ASSEMBLE[Assemble bounded prompt context<br/>relevant history, evidence, rules and format]
-    ASSEMBLE --> BUDGET{Within input token budget?}
-    BUDGET -- No --> TRIM[Trim unrelated history first,<br/>then low-ranked evidence]
-    TRIM --> FIT{Required evidence and instructions fit?}
-    FIT -- Yes --> REDACT
-    FIT -- No --> SAFE
-    BUDGET -- Yes --> REDACT[Minimize or mask sensitive data]
-    REDACT --> MODEL[LLM generates structured draft]
-    MODEL --> GENERATED{Draft generated successfully?}
-    GENERATED -- Yes --> VALIDATE[Validate schema, policy constraints and groundedness]
-    GENERATED -- Transient failure --> RETRY{Retry budget remains?}
-    RETRY -- Yes --> BACKOFF[Bounded backoff]
-    BACKOFF --> MODEL
-    RETRY -- No --> SAFE
-    VALIDATE --> CITATION[Resolve citations to document, version, section and page]
-    CITATION --> PASS{Validation and citation checks pass?}
-    PASS -- No --> SAFE
-    PASS -- Yes --> FINAL[Return answer with citations and uncertainty]
-    SAFE --> AUDIT[(Audit / trace record)]
-    HUMAN --> AUDIT
-    FINAL --> AUDIT
-    AUDIT --> METRICS[Emit latency, quality, safety and cost telemetry]
-```
-
-This response flow invokes generation only when retrieved evidence is both authorized and sufficient. Bounded context assembly includes only a rewritten query, selected history, relevant evidence, and approved rules—not the full transcript. The token-budget gate reserves room for safety instructions and output; it trims unrelated history and then low-ranked evidence, and falls back to clarification/review if required evidence cannot fit intact. Data minimization reduces unnecessary exposure of customer information. Structured generation is followed by schema, policy, groundedness, and citation checks so unsupported or malformed answers do not reach users. The audit record links the request, selected history references, evidence, model/configuration, validation outcome, and citations; telemetry supports production monitoring and continuous evaluation.
-
----
-
-## 11. Guardrails in the RAG Layer
-
-The RAG pipeline must include safety and compliance checks.
-
-### Input guardrails
-
-- detect prompt injection
-- sanitize user input
-- prevent malicious retrieval manipulation
-
-### Retrieval guardrails
-
-- filter out documents the user is not authorized to read
-- block stale or superseded policy versions
-- remove irrelevant or low-quality documents before ranking
-
-### Output guardrails
-
-- enforce groundedness checks
-- prevent unsupported claims
-- require citation presence for factual or policy-based answers
-- flag answers requiring human review
-
-### Sensitive scenarios
-
-- claim denial explanation
-- legal interpretation of policy clauses
-- premium disputes
-- customer-specific coverage decisions
-- ambiguous exclusions or regulatory concerns
-
-These should often route to human review or advisor workflows.
-
----
-
-## 12. Citation Strategy
-
-Citations are not optional in an enterprise insurance assistant.
-
-### Required citation components
-
-- source document name
-- section name or clause title
-- document version
-- page or chunk identifier
-- time of policy validity
-- stable evidence ID and mapping to the exact retrieved chunk/source offsets
-
-Treat model citation generation as reference selection, not proof. A server-side validator must reject unknown, unauthorized, stale, or mismatched citation IDs and ensure material policy claims have supporting evidence. Validate customer facts and rule outputs against their own system-of-record provenance; policy citations do not substantiate customer-specific facts.
-
-### Example
-
-“Coverage is available for emergency hospitalization under the Health Plus policy, Section 4.3, Policy Version 2025.01 (source: Policy Doc 2025, chunk H-173).”
-
-This helps with:
-
-- auditability
-- compliance review
-- advisor trust
-- customer transparency
-
----
-
-## 13. RAG Evaluation Strategy
-
-A production-grade RAG system needs repeatable offline evaluation and separate online operational monitoring. Ragas is recommended for offline evaluation of curated datasets. LangSmith is optional for LLM-specific experiments and trace inspection; OpenTelemetry, Azure Monitor, and Application Insights remain the production observability system.
-
-### Offline evaluation
-
-Maintain a versioned, SME-reviewed dataset containing query intent, user/customer scope, expected evidence IDs, policy version/effective date, expected answer facts, expected citations, and expected clarification/escalation outcomes. Run evaluations when changing extraction, chunking, metadata, embeddings, hybrid fusion, MMR, BGE, compression, prompts, models, or conversation rewriting.
-
-Use Ragas selectively for:
-
-- **Faithfulness:** Are answer claims supported by retrieved context? Pair with deterministic citation checks.
-- **Answer Relevancy:** Does the response address the actual user intent, including correct clarification or abstention?
-- **Context Precision:** Are retrieved chunks useful and relevant? Evaluate alongside recall to avoid dropping exclusions.
-- **Context Recall:** Does the retrieved set contain required evidence? Requires complete reference evidence labeled by insurance SMEs.
-
-Keep deterministic checks in the release gate for citation ID resolution, authorization filters, source version/effective date, response schema, required disclosures, and token/timeout limits. Ragas/LLM-judge scores are estimates: pin evaluator/model/metric versions, calibrate against human review, and do not approve a release based on a single aggregate score.
-
-Additional retrieval metrics may include recall@k, precision@k, nDCG, MRR, and document hit rate, segmented by product, jurisdiction, query type, and policy version.
-
-### Online / production monitoring
-
-The user request path uses deterministic controls and does not wait for Ragas or a model judge. OTel/Azure Monitor/Application Insights measure request and stage latency, errors, dependency health, token cost, retrieval/reranker scores, index freshness, cache behavior, no-hit/low-confidence, citation rejection, clarification, guardrail, and escalation rates.
-
-If model-judged Faithfulness or Answer Relevancy is used online, run it asynchronously on a privacy-reviewed sample with an explicit budget. Store the evaluator version and sample provenance; evaluator failure must not block the user response. Use sampled human review and user/advisor feedback to calibrate signals.
-
-### LangSmith placement
-
-LangSmith may be used in development/staging to inspect traces, compare prompts/models, and manage experiment datasets. It overlaps with OTel/Azure tracing, so it is optional, not another mandatory production telemetry plane. If approved for production trace inspection, export only minimized/redacted content; define data residency, access, retention, sampling, and outage behavior. User requests must not depend on LangSmith availability.
-
-### Feedback-to-improvement loop
-
-User/advisor feedback and sampled human review are signals for investigation, not automatic labels or automatic model/prompt updates. A reviewer should confirm the issue and expected evidence/answer, redact or minimize sensitive data, and add an approved example to a versioned regression set. Candidate retrieval, prompt, chunker, model, or routing changes run through offline evaluation and release approval before rollout.
+### Q&A Flow Diagram
 
 ```mermaid
 flowchart LR
-    RESPONSE[Served answer and trace IDs] --> FEEDBACK[User/advisor feedback or sampled review]
-    FEEDBACK --> TRIAGE[Privacy screening and human triage]
-    TRIAGE -->|Confirmed and reproducible| GOLD[SME-approved versioned example]
-    TRIAGE -->|Unclear / sensitive| HOLD[Investigate or discard under policy]
-    GOLD --> EVAL[Ragas + deterministic regression suite]
-    CHANGE[Candidate retrieval / prompt / model change] --> EVAL
-    EVAL --> GATE{Quality, safety and latency gates pass?}
-    GATE -->|No| FIX[Revise or reject change]
-    FIX --> CHANGE
-    GATE -->|Yes| APPROVAL[Owner and compliance approval]
-    APPROVAL --> ROLLOUT[Canary rollout and OTel/Azure monitoring]
-    ROLLOUT -->|Regression| ROLLBACK[Rollback to known-good version]
-    ROLLOUT -->|Stable| MONITOR[Continue monitored operation]
+    USER[User question] --> API[Validate and authorize]
+    API --> ROUTE[Query understanding]
+    ROUTE --> HIST[Selected conversation context if needed]
+    HIST --> REWRITE[Rewrite only ambiguous follow-ups]
+    ROUTE --> CUSTOMER[Fetch authorized customer context if needed]
+    REWRITE --> RETRIEVE[Filtered RAG retrieval]
+    ROUTE --> RETRIEVE
+    CUSTOMER --> CONTEXT[Typed context assembly]
+    RETRIEVE --> RERANK[BGE reranking and evidence sufficiency]
+    RERANK --> CONTEXT
+    CONTEXT --> LLM[Grounded response generation]
+    LLM --> GUARD[NeMo/application guardrails]
+    GUARD --> VALIDATE[Schema, provenance and citation validation]
+    VALIDATE -->|Pass| ANSWER[Cited answer]
+    VALIDATE -->|Fail / uncertain| SAFE[Clarify, abstain or hand off]
 ```
 
-This creates a controlled feedback → evaluation → improvement → regression-testing loop. Automated online learning, automatic prompt mutation, and direct writes from thumbs-up/down into a training corpus are not specified and should not be enabled without separate governance and validation.
+The policy reasoning step explains retrieved clauses and their conditions; it does not override policy source text or deterministic rules. Personalized answers require current authorized customer facts. Generic policy answers may continue without customer context if authorization and wording make that safe.
 
-### Additional answer-quality signals
+## 9. Product Recommendation Flow
 
-- groundedness
-- citation correctness
-- answer faithfulness
-- refusal correctness
-- usefulness for customer or advisor workflow
-- intent-preservation and clarification correctness for multi-turn follow-ups
+### Separation from Q&A
 
-### Example evaluation scenarios
+Product recommendation is a dedicated use case and API, not an implicit side effect of general Q&A:
 
-- claim eligibility question
-- product comparison question
-- claim procedure question
-- policy exclusion question
-- answer requiring routing to a human advisor
-- simple FAQ routed directly without an unnecessary rewrite/model call
-- follow-up query with a correctly resolved antecedent and one with ambiguous antecedents
-- compound claim query with recall across policy evidence and claims-system facts
+```http
+POST /api/v1/recommendations
+```
 
----
+The endpoint is a **proposed contract**; no implementation is asserted. Authenticate and authorize the subject customer, enforce consent/purpose requirements, and validate product catalog and rules versions.
 
-## 14. Failure Modes in RAG
+Example request:
 
-### Retrieval failure
-- no relevant chunks found
-- wrong document version selected
-- too many irrelevant results
+```json
+{
+  "customer_id": "opaque-customer-reference",
+  "needs": ["hospitalization", "family coverage"],
+  "jurisdiction": "example-jurisdiction",
+  "as_of": "2026-10-07",
+  "max_results": 3
+}
+```
 
-### Answer failure
-- the model hallucinates policy language
-- the answer is too generic and not policy-specific
-- the citation is missing or wrong
+Example response:
 
-### Data failure
-- stale document remains indexed
-- OCR extraction is poor
-- table data is misread
-- metadata is incomplete
+```json
+{
+  "status": "completed",
+  "recommendations": [
+    {
+      "product_id": "catalog-product-id",
+      "product_name": "Catalog display name",
+      "eligibility": {
+        "status": "eligible",
+        "rule_version": "rule-version",
+        "reason_codes": ["validated-rule-code"]
+      },
+      "matched_needs": ["hospitalization"],
+      "limitations": ["Applicable waiting period applies"],
+      "explanation": "Non-binding explanation based on validated inputs.",
+      "citations": [
+        {
+          "document_id": "approved-document-id",
+          "version": "current-version",
+          "section": "Relevant clause",
+          "page": 1,
+          "evidence_id": "retrieved-evidence-id"
+        }
+      ]
+    }
+  ],
+  "disclosures": ["Recommendation is not a coverage or claim determination."],
+  "trace_id": "opaque-correlation-id"
+}
+```
 
-### Mitigation
+Use actual contract enums, field constraints, error models and pagination only after API/schema design; the example does not assert those are implemented.
 
-- validation before indexing
-- retrieval quality checks
-- citation requirement as a hard gate
-- reprocessing and version correction pipeline
-- human review for domain-sensitive results
+### Recommendation data and node responsibilities
 
----
+1. **API/auth node:** validate request, identity, subject-customer relationship, consent/purpose and rate limits.
+2. **Customer context node:** fetch only required profile, needs, current policies/coverage and claim-history fields from their authoritative systems; attach freshness/provenance.
+3. **Catalog node:** obtain active products, jurisdiction, terms, version and availability from the product catalog (specific service is a gap).
+4. **Eligibility/suitability node:** apply deterministic versioned business rules; produce eligible/ineligible/insufficient-data status and reason codes. LLM does not decide eligibility or regulated suitability.
+5. **Candidate selection node:** filter to eligible products and rank using approved deterministic criteria/weights. The ranking method and compliance constraints must be owned by the product/business team.
+6. **Evidence node:** retrieve current product/policy documents for candidate claims, benefits, exclusions, waiting periods and limitations. Apply the same authorization/version/effective-date controls.
+7. **Explanation node:** optionally use one constrained LLM call to express already validated candidate/rule/evidence results. It cannot introduce candidates, change eligibility, or invent benefits.
+8. **Response validation node:** verify product IDs remain active, rule/catalog versions are current, citations resolve to authorized evidence, disclosures are present, and schema is valid.
+9. **Audit/monitoring node:** record opaque trace ID, rule/catalog/source versions, evidence references, decision reason codes, and human review outcome under approved data retention.
 
-## 15. Security and Compliance in RAG
+### Recommendation-specific failures
 
-The RAG layer must enforce strict access rules.
+- Missing/stale profile, policy or claim data → return `insufficient_data` or source-unavailable status; do not assume eligibility.
+- Catalog/rule version mismatch → stop before ranking and retry/reconcile; fallback is no recommendation, not an older product list unless explicitly valid.
+- No eligible candidates → return no-match with approved reason codes; do not ask LLM to invent an alternative.
+- RAG source missing or conflicting → omit unsupported product claims, request review, or return no recommendation when material terms cannot be verified.
+- Unsupported suitability/regulatory situation → human advisor review; the LLM explanation is non-binding.
 
-### Key requirements
+Production decisions still required include real catalog/rules APIs, data freshness, product-ranking governance, consent/purpose checks, status/error codes, recommendation audit retention, and compliance approval of disclosures.
 
-- user can only access authorized documents
-- customer data access follows RBAC/ABAC policies
-- conversation-history retrieval is scoped to the authenticated tenant, user, and conversation; stored turns and summaries are untrusted continuity context, not authorization or evidence
-- ACL, effective-date, and version filters are built from trusted identity and enterprise metadata, not inferred or widened by a model
-- documents with expired or superseded versions should not be used
-- PII should be masked before model execution when necessary
-- all retrievals and answers should be auditable
-- traces and evaluation exports are minimized/redacted and governed by retention, residency, and access policy
-
-No answer should be generated from a document the user is not allowed to access, even if it exists in the index.
-
----
-
-## 16. Performance and Scaling Considerations
-
-RAG must scale across both user queries and ingestion workloads.
-
-### Scaling techniques
-
-- asynchronous ingestion workers
-- horizontal scaling of retrieval and API services
-- metadata filtering to reduce search cost
-- vector index replication or sharding where needed
-- Redis caching for common retrieval patterns and FAQ summaries
-- query-time pruning of low-value documents
-
-### Latency optimization
-
-- do not retrieve full-document context for simple FAQ lookups
-- precompute common retrieval patterns
-- keep chunk sizes tight and context-aware
-- use reranking only on a limited candidate set
-
----
-
-## 17. Final Recommended RAG Architecture
+### Recommendation Flow Diagram
 
 ```mermaid
 flowchart TD
-    subgraph INDEX[Indexing - asynchronous]
-        DOC[Approved document] --> DI[Azure AI Document Intelligence]
-        DI --> CHUNK[Structure-aware insurance chunking]
-        CHUNK --> META[Metadata + provenance + quality gates]
-        META --> EMB[Versioned embeddings]
-        EMB --> Q[(Qdrant)]
-        META --> M[(MongoDB lineage and processing state)]
-        Q --> ACT[Validate staged index and activate version]
-        M --> ACT
-    end
-
-    subgraph PRE[Pre-retrieval]
-        U[User query] --> ACL[Authorize user, tenant and customer]
-        ACL --> UNDERSTAND[Query understanding and domain routing]
-        UNDERSTAND --> ROUTE{Classify query}
-        ROUTE -- Self-contained --> DIRECT[Direct retrieval]
-        ROUTE -- Ambiguous follow-up --> HIST[Load bounded recent and relevant history]
-        HIST --> REWRITE[Conditional conversation-aware rewrite]
-        ROUTE -- Complex facets --> MULTI[Optional capped multi-query]
-    end
-
-    subgraph RETR[Retrieval]
-        DIRECT --> FILTER[ACL, product, jurisdiction and effective-date filters]
-        REWRITE --> FILTER
-        MULTI --> FILTER
-        FILTER --> DENSE[Qdrant dense search]
-        FILTER --> LEX[Optional BM25 / lexical search]
-        DENSE --> FUSE[Rank fusion and deduplication]
-        LEX --> FUSE
-        FUSE --> DIVERSITY{Duplicate-heavy candidates?}
-        DIVERSITY -- Yes, if evaluated --> MMR[Conservative MMR]
-        DIVERSITY -- No --> BGE[BGE cross-encoder reranking]
-        MMR --> BGE
-        BGE --> SIZE{Evidence exceeds context budget?}
-        SIZE -- Yes --> COMP[Optional extractive compression with source offsets]
-        SIZE -- No --> EVIDENCE[Ranked evidence]
-        COMP --> EVIDENCE
-    end
-
-    subgraph ANSWER[Augmentation and generation]
-        CUST[Authorized customer facts from systems of record] --> CTX
-        RULE[Governed business-rule results] --> CTX
-        EVIDENCE --> CTX[Typed prioritized context assembly]
-        HIST --> CTX
-        CTX --> PROMPT[Versioned grounded prompt and token budget]
-        PROMPT --> GPT[OpenAI GPT]
-        GPT --> NEMO[NeMo Guardrails]
-        NEMO --> VALID[Schema, provenance and citation validation]
-        VALID --> OUT[Answer, clarification, abstention or human review]
-    end
-
-    subgraph EVAL[Evaluation and monitoring]
-        GOLD[SME-reviewed dataset] --> RAGAS[Ragas offline evaluation]
-        RAGAS --> GATE[Release/change gate]
-        OTel[OTel + Azure Monitor / App Insights] --> DASH[Online dashboards and alerts]
-        OTel -. optional redacted traces .-> LS[LangSmith optional]
-    end
+    CLIENT[Customer / advisor client] --> ENDPOINT[POST /api/v1/recommendations]
+    ENDPOINT --> AUTH[Authenticate, authorize subject and validate purpose]
+    AUTH -->|Denied| DENY[Generic denial; no customer data disclosure]
+    AUTH -->|Allowed| FANOUT{Authorized data reads}
+    FANOUT --> PROFILE[Customer profile / stated needs]
+    FANOUT --> POLICIES[Existing policies / coverage]
+    FANOUT --> CLAIMS[Claim history / status as permitted]
+    FANOUT --> CATALOG[Active product catalog and version]
+    PROFILE --> JOIN[Validate freshness and completeness]
+    POLICIES --> JOIN
+    CLAIMS --> JOIN
+    CATALOG --> JOIN
+    JOIN -->|Missing/stale| INSUFFICIENT[Insufficient data / retry / advisor]
+    JOIN -->|Valid| RULES[Deterministic eligibility and suitability rules]
+    RULES -->|No eligible product| NONE[No recommendation with reason codes]
+    RULES -->|Candidates| FILTER[Select/rank candidates by approved criteria]
+    FILTER --> RAG[Retrieve product/policy terms and limitations]
+    RAG --> EXPLAIN[Optional constrained LLM explanation]
+    EXPLAIN --> CHECK[Validate active product, rule version,<br/>citations, disclosures and schema]
+    CHECK -->|Pass| RESULT[Explainable non-binding recommendations]
+    CHECK -->|Fail / conflict| REVIEW[Abstain or human review]
 ```
 
-### Execution policy
+## 10. Retrieval Optimization
 
-1. Keep Document Intelligence, Qdrant, MongoDB, conversation-aware history, LangGraph, GPT, NeMo, and server-side citation validation.
-2. Add structure-aware chunking, extraction/chunk quality gates, complete metadata/provenance, embedding-version tracking, staged index activation, and tested re-index rollback.
-3. Authorize and route every query. Use direct retrieval for self-contained simple questions; invoke query rewriting only for ambiguous follow-ups; invoke capped multi-query only for complex decomposable questions.
-4. Use Qdrant dense search plus a lexical/BM25 index where deployed, with identical ACL/version filters and rank fusion. Retain BGE; enable conservative MMR only when duplicate-heavy retrieval is demonstrated; compress extractively only when context size warrants it.
-5. Assemble separately typed system/security instructions, user query, customer facts, governed rule outputs, policy evidence, conversation history, and output contract. Conversation history is continuity context only and cannot override authoritative sources.
-6. Generate structured output that distinguishes retrieved policy facts, customer-specific facts, business-rule results, and model-generated explanation/recommendation. Resolve citations server-side and abstain/escalate on unsupported or conflicting facts.
-7. Run Ragas metrics offline on curated SME-reviewed evaluations; keep OTel/Azure online monitoring. LangSmith and online LLM-judge scoring remain optional, privacy-reviewed, asynchronous, and non-blocking.
+### Dense and lexical retrieval
 
-## 18. RAG Architecture Decision Summary
+Dense Qdrant retrieval handles semantic paraphrase; lexical/BM25 retrieval helps exact clause numbers, defined terms, product names, claim codes and amounts. Use hybrid retrieval only when a synchronized lexical index is deployed and has identical ACL, version, jurisdiction and effective-date filters. Fuse with a rank-fusion method such as reciprocal rank fusion and monitor each leg separately. If no lexical index exists, document and operate semantic-only retrieval.
 
-The recommended architecture is:
+### MMR, BGE and compression
 
-- Qdrant for vector storage and retrieval
-- metadata-aware authorization, policy, jurisdiction, and version filtering
-- dense Qdrant + lexical/BM25 hybrid retrieval where deployed, fused before reranking
-- cross-encoder re-ranking for precision
-- structure-aware chunking, quality gates, versioned embeddings, and staged re-indexing
-- conditional query rewriting and domain routing; capped multi-query only for complex requests
-- optional MMR/compression only where evaluated gains justify complexity
-- evidence-grounded answer generation with citations
-- explicit separation of customer facts, policy facts, rule results, history, and model explanations
-- strict guardrails and access control
-- async ingestion from source documents to vector index
-- offline Ragas evaluation and online OTel/Azure monitoring; LangSmith optional
+- **BGE cross-encoder — recommended:** retain as primary reranker after candidate retrieval/fusion. Bound candidate count and batch inference. It improves relevance ordering, cannot recover a missed source, and does not prove correctness.
+- **MMR — optional:** use conservatively before BGE only if duplicate-heavy candidates are demonstrated and evaluation confirms it does not discard complementary exclusions, definitions or exceptions.
+- **Contextual compression — optional:** apply before final context assembly only when evidence exceeds the token budget. Prefer extractive span selection preserving source offsets and chunk IDs; retain source chunks as authority. Avoid generated paraphrases being treated as quotes/evidence.
+- **Top-K — recommended to tune empirically:** bound dense/lexical candidates and reranker input, but choose values using recall@k and clause-level evaluation, not a generic heuristic.
+- **Deduplication — recommended:** deduplicate stable chunk IDs and near duplicates after fusion, while preserving version-, endorsement- and exception-distinct content.
 
-This architecture gives the best balance of accuracy, safety, enterprise readiness, and explainability for an insurance assistant.
+## 11. Context Augmentation
 
----
+Build a structured prompt from separately typed and provenance-labelled blocks:
 
-## 19. Edge Case & Failure Handling
+1. **System/security instructions and output contract** — fixed; never displaced.
+2. **Current user request and validated standalone rewrite** — preserve original wording.
+3. **Customer facts** — authorized source, timestamp/freshness and data purpose.
+4. **Business-rule results** — rule version and reason codes; deterministic output.
+5. **Retrieved policy/product evidence** — stable evidence IDs, source/version/page/section, effective period.
+6. **Conversation context** — selected turns/summary for reference resolution only.
 
-RAG must fail closed whenever source quality, authorization, version, or grounding cannot be verified. The ingestion, retrieval, and response diagrams above show the primary quarantine, retry, no-answer, validation, and escalation paths.
+The priority is a trust boundary, not merely prompt ordering. History, user text and retrieved documents are untrusted content; they cannot override system controls, permissions, current customer facts, policy versions or governed rules. On authoritative conflict, ask clarification or escalate. Remove duplicate context without merging materially distinct clauses. Token selection must retain qualifications, exceptions, amounts and evidence provenance.
 
-### Scenario: Duplicate upload or replayed ingestion event
+## 12. Generation & Citations
 
-- **Why it can happen:** Event brokers provide at-least-once delivery, admins may retry an upload, or an orchestrator may replay a job after timeout.
-- **How the architecture detects it:** Use a stable document ID plus source checksum, version ID, and idempotency key; compare processing state and index records before writes.
-- **How the system handles/recover from it:** Make workflow stages idempotent. Reuse completed extraction results when valid, or replace the same version atomically; do not create duplicate chunks or embeddings.
-- **Fallback behavior:** Keep the last validated searchable version while the duplicate/replay is reconciled; quarantine conflicting content for operations review.
-- **Impact on the user/system:** Normally none; unresolved conflicts can delay publication of the affected version.
-- **Monitoring/alerting required:** Count duplicate events, idempotent no-ops, conflicting checksums, and replay attempts; alert on repeated conflicts or unusual event bursts.
+Generate a structured answer only after evidence and customer/rule context pass authorization and sufficiency gates. The output must distinguish:
 
-### Scenario: OCR or layout extraction is incomplete or corrupt
+- retrieved policy/product facts;
+- customer-specific facts with system-of-record provenance;
+- deterministic eligibility/business-rule outcomes with rule version and reason codes;
+- model-generated explanation or recommendation narrative, explicitly non-binding.
 
-- **Why it can happen:** Scanned or rotated pages, low-resolution images, handwritten annotations, unsupported tables, encrypted PDFs, or Document Intelligence outages.
-- **How the architecture detects it:** Validate extraction completeness, page coverage, table structure, OCR confidence, required metadata, and document-level quality thresholds.
-- **How the system handles/recover from it:** Retry transient service failures with bounded backoff; apply approved preprocessing or alternate extraction for supported cases; persist the original and extraction diagnostics; route low-quality documents to manual review.
-- **Fallback behavior:** Do not index a document/version that failed required quality checks; retain an older version only if its validity period still applies.
-- **Impact on the user/system:** Newly updated content may not be searchable; the assistant avoids giving answers from corrupted or partial text.
-- **Monitoring/alerting required:** Track extraction latency, confidence, page/table coverage, retries, quarantine volume, and failure rates by source type.
+The LLM may reference only evidence IDs supplied in the context. A server-side validator resolves each ID and verifies source, version, page/section, access and material claim support. Customer facts and rule results are validated against their respective provenance; policy citations do not prove customer-specific facts. Invalid citation IDs, unsupported material claims, unresolved conflicts or malformed structured output fail closed.
 
-### Scenario: Partial indexing or inconsistent document-version publication
+Recommended citation fields: document name/ID, version/effective date, section/clause, page, stable evidence ID and source offset. Return a clarification, limitation, abstention or human handoff rather than a fluent unsupported answer.
 
-- **Why it can happen:** Qdrant writes succeed while MongoDB metadata writes fail, indexing is interrupted, or an update is made searchable before all chunks are validated.
-- **How the architecture detects it:** Compare expected and actual chunk counts, IDs, version metadata, and checksums across MongoDB and Qdrant before marking a version active.
-- **How the system handles/recover from it:** Stage writes under a non-searchable version, retry idempotently, validate cross-store consistency, and activate the version only after validation. Remove or rebuild incomplete staged data.
-- **Fallback behavior:** Continue serving the last validated version only when effective-date rules allow; otherwise return an unavailable-source result and escalate.
-- **Impact on the user/system:** Index freshness may be delayed, but incomplete or mixed-version policy evidence is not served.
-- **Monitoring/alerting required:** Alert on index/metadata count mismatch, activation delay, failed validation, orphan vectors, and active-version drift.
+## 13. Guardrails & Security
 
-### Scenario: Unauthorized or cross-tenant retrieval/cache collision
+### Request, retrieval and response controls
 
-- **Why it can happen:** Incorrect ACL metadata, a missing tenant filter, stale permissions, or a retrieval cache key that omits user/customer scope.
-- **How the architecture detects it:** Enforce authorization before retrieval and again before context assembly; test tenant boundaries; include access scope and policy version in cache keys and verify cached payload metadata.
-- **How the system handles/recover from it:** Reject the result, invalidate affected cache entries, prevent prompt assembly, and raise a security event for investigation. Restrict cache use if scope cannot be proven.
-- **Fallback behavior:** Return a generic access failure without confirming the existence or contents of protected documents.
-- **Impact on the user/system:** Affected requests fail safely; a confirmed leak is a security incident requiring containment and response.
-- **Monitoring/alerting required:** Alert on ACL-filter failures, cache scope mismatches, cross-tenant test failures, and anomalous denied/allowed retrieval patterns.
+- Validate schemas, payload sizes, attachment allowlists, rate limits and authorization at API boundaries.
+- Authenticate/authorize before history, customer, catalog or document retrieval; apply the same scope at cache reads and prompt assembly.
+- Treat user messages, conversation summaries and retrieved text as untrusted data; screen for prompt injection and never execute instructions found in evidence.
+- Minimize customer data before external model/trace boundaries. Apply approved PII detection/masking when required by data classification.
+- Use NeMo Guardrails for configured dialogue/input/output behavior, backed by deterministic application authorization, rule, schema, provenance, grounding and citation validation.
+- Redact/minimize telemetry; use opaque IDs; control trace access, retention, residency and deletion.
+- Sensitive claim denial, disputed coverage, legal ambiguity and suitability decisions require human review where governed policy says so.
 
-### Scenario: No relevant, current, or sufficiently confident evidence
+### Presidio vs NeMo Guardrails
 
-- **Why it can happen:** Query is ambiguous, a policy is not indexed, metadata is wrong, the requested coverage is not documented, or retrieval/reranking misses relevant clauses.
-- **How the architecture detects it:** Apply minimum relevance and evidence coverage thresholds; check document effective dates, required source types, and expected citation availability.
-- **How the system handles/recover from it:** Optionally reformulate or broaden the query within the same authorization scope and run a bounded second retrieval; preserve the original query and scores for audit.
-- **Fallback behavior:** Do not fabricate an answer. Ask a clarifying question, state that supporting evidence was not found, or route to an advisor.
-- **Impact on the user/system:** Reduced self-service resolution and possible human workload, but lower risk of unsupported insurance guidance.
-- **Monitoring/alerting required:** Track no-hit and low-confidence rates by product, question intent, document version, and retrieval configuration; alert on regressions from baseline.
+Microsoft Presidio (or an approved equivalent DLP/PII service) detects and may anonymize PII; NeMo checks configured dialogue, input/output and safety policy. They are complementary, not substitutes. Presidio is a candidate implementation, not a selected/deployed component in the current architecture. Whether it is required depends on data classification, model processing agreements and trace destinations. Define identifiers/regions, false-negative tests, masking/restoration behavior and outage policy before deployment. Neither tool is an authorization or factuality boundary.
 
-### Scenario: Grounding, citation, or model output validation fails
+## Token & Cost Optimization
 
-- **Why it can happen:** Model output is malformed, cites a nonexistent chunk, combines conflicting clauses, omits a required qualification, or a prompt/model update regresses quality.
-- **How the architecture detects it:** Validate response schema, citation IDs against retrieved evidence, document version and page references, policy constraints, and groundedness thresholds.
-- **How the system handles/recover from it:** Reject the draft; allow at most a bounded regeneration using the same validated evidence if policy permits; otherwise record the failed trace and route to review. Roll back a harmful prompt/model change.
-- **Fallback behavior:** Return a safe limitation or human-review path, never the unvalidated draft.
-- **Impact on the user/system:** The user may receive a delayed or limited answer; incorrect citations and unsupported coverage statements are withheld.
-- **Monitoring/alerting required:** Monitor validation rejection, regeneration, citation mismatch, groundedness, safety escalation, and model/prompt-version quality metrics.
+| Optimization | Status | Application / safeguard |
+|---|---|---|
+| Query rewriting only when required | **Recommended** | Direct retrieval for self-contained queries; rewrite ambiguous follow-ups only; preserve original and validate scope |
+| Avoid unnecessary model/agent calls | **Recommended** | Deterministic-first routing, no autonomous agent per backend service, one final generation call where possible |
+| Conversation summarization | **Recommended** | Refresh compact summary from canonical turns when bounded recent history exceeds budget; do not summarize recursively as sole source |
+| Relevant-history retrieval | **Recommended** | Load scoped recent window and at most a bounded number of relevant older turns; never send full transcript |
+| Top-K optimization | **Recommended** | Tune candidate K and reranker top-N against evidence recall, critical exceptions and p95; cap fan-out |
+| BGE reranking before generation | **Recommended** | Use bounded candidates to improve evidence precision and reduce irrelevant prompt tokens |
+| Contextual compression | **Optional** | Extractive offsets-preserving spans only when long context justifies processing; test qualifier retention |
+| Deduplication | **Recommended** | Remove duplicate chunk IDs/near duplicates after fusion without collapsing version-specific content |
+| Prompt optimization | **Recommended** | Version concise templates, remove repeated boilerplate and constrain structured output; regression-test every change |
+| Model selection by task complexity | **Recommended, gated** | Small/low-cost model or deterministic code for routing/rewrite where qualified; stronger model only for supported complex explanation; do not change model without quality/privacy evaluation |
+| Redis caching | **Optional** | Cache only safe repeatable results with tenant/auth/version/purpose-aware keys and TTL/invalidation; never use cache as source of truth |
+| Hard token budgets | **Recommended** | Model-specific tokenizer, completion reserve and safety margin; never truncate instructions, latest question, qualifications or citations |
+| MMR | **Optional** | Only if duplicate-heavy results are measured and no evidence loss occurs |
+| Hybrid retrieval | **Recommended when deployed and measured** | Can reduce misses for exact terminology, but adds index synchronization/search cost |
 
-### Scenario: Hybrid retrievers disagree or lexical index is stale
+Track token usage and cost per request/workflow and stage (rewrite, embedding/query, reranker, generation, guardrail, optional judge), model, tenant/channel and outcome. Alert on anomalous cost, fan-out, input truncation, cache-scope errors and cost per successful task. A lower token count is not an optimization if it drops an exclusion or required citation.
 
-- **Why it can happen:** BM25/lexical indexing lags behind Qdrant, analyzers tokenize policy identifiers differently, or one retriever returns a different document generation.
-- **How the architecture detects it:** Compare index generation/version IDs, per-retriever freshness and hit rates, and source/version metadata during candidate fusion.
-- **How the system handles/recover from it:** Exclude stale generations; use only candidates whose ACL/version metadata validates; retry or rebuild the lexical index through the staged re-index process.
-- **Fallback behavior:** Use validated Qdrant dense results if their quality threshold passes; otherwise abstain or escalate rather than merging inconsistent sources.
-- **Impact on the user/system:** Temporary reduction in recall or latency while index synchronization is restored; no mixed-version evidence is presented.
-- **Monitoring/alerting required:** Track freshness lag and hit/error/latency metrics per retriever, fusion candidate source, and index generation; alert on drift or mismatch.
+## 15. Edge Cases & Failure Handling
 
-### Scenario: MMR or contextual compression removes a material qualification
+The table gives the required response pattern: **detection → handling → fallback → user/system impact**. Monitoring should also alert on rates, duration, repeated retries and affected document/product/version; operational ownership and thresholds must be configured.
 
-- **Why it can happen:** Diversity selection suppresses related clauses, or compression omits an exception, waiting-period qualifier, amount, or table relationship.
-- **How the architecture detects it:** Evaluate reference-evidence recall before/after these stages; retain source chunk IDs/offsets and require citation/grounding checks for every material claim.
-- **How the system handles/recover from it:** Disable MMR/compression for the affected domain/query class; retrieve the original full chunk; reject summaries without source offsets or where required conditions do not fit.
-- **Fallback behavior:** Use the uncompressed validated chunk if it fits; otherwise ask a focused question or route to review.
-- **Impact on the user/system:** Additional latency or context use; prevents incomplete coverage guidance caused by optimization.
-- **Monitoring/alerting required:** Measure token reduction against evidence recall, citation correctness, qualifier retention, and answer quality by configuration.
+| Scenario | Detection | Handling | Fallback | User/system impact |
+|---|---|---|---|---|
+| No relevant documents | Empty results or no candidate above calibrated relevance threshold | Check route, filters and index freshness; do not force generation | Ask a narrower question, provide safe general limitation, or human handoff | No policy-specific answer; request may need clarification |
+| Low-confidence retrieval | Calibrated retrieval/reranker score or insufficient required evidence | Re-retrieve within bounded budget or check current source/version; do not equate score with truth | Abstain or send for review | Delayed/incomplete answer, reduced hallucination risk |
+| Ambiguous/follow-up query | Multiple antecedents, low rewrite confidence, scope mismatch | Resolve from bounded authorized history; preserve original; validate intent/scope | Ask a clarifying question | One extra turn; avoids wrong policy/product |
+| Very long conversation / summary failure | Token budget exceeded, summary stale/missing, summary job/storage error | Refresh from canonical turns; retrieve bounded relevant older turns; retain mandatory prompt/evidence | Use recent window or ask user to restate context | Continuity may be reduced; no full transcript sent |
+| Conflicting documents or versions | Multiple current candidates, inconsistent metadata/effective dates, conflicting clauses | Verify source approval, endorsement and jurisdiction; retrieve authoritative version; require human interpretation when still conflicting | Abstain/escalate; never silently choose one | Answer unavailable pending review |
+| Expired policy/document | Effective-date filter or source validation shows expired/superseded version | Exclude unless the user's explicitly dated historical query authorizes that period | State current evidence unavailable or retrieve valid historical version under policy | No present-tense coverage claim from expired terms |
+| Duplicate documents | Checksum/source hash, duplicate chunk IDs or near-duplicate metrics | Idempotent ingestion; retain distinct versions/endorsements where material | Quarantine checksum conflicts; serve validated active generation | Usually none; unresolved conflict delays indexing |
+| Corrupt/scanned PDF or poor OCR | Parser error, low confidence, page coverage/table-integrity check | Bounded retry/preprocess if supported; quarantine and operator review | Keep prior version only while legally/effectively valid; otherwise no answer from it | Revised content not searchable; manual processing may be needed |
+| Extraction/OCR service failure | Timeout, throttling, malformed output, failed extraction gate | Retry transient failures with jitter and quotas; record diagnostics | DLQ/quarantine; do not publish partial content | Ingestion delay; old valid version may remain |
+| Embedding timeout/rate limit | Provider timeout/429, dimension/schema mismatch, retry exhaustion | Backoff within job deadline; resume idempotently; verify model/dimension version | Keep staged generation inactive; replay later | New/reindexed content delayed |
+| LLM timeout/rate limit/malformed output | Provider status/deadline, parse/schema failure | Retry only transient errors within request budget; retain attempt IDs | Safe retry response, abstention or human handoff; qualified alternate model only if approved | Slower or unavailable generated response |
+| Qdrant failure | Health/query errors, timeout, missing active generation | Bounded retry/circuit breaker; restore/fail over only to validated replica | No policy answer without evidence; safe unavailable response | RAG temporarily unavailable |
+| MongoDB metadata/lineage failure | Read/write errors or cross-store version mismatch | Stop publication; repair/reconcile from immutable source and staged index | Keep previous valid generation if effective; otherwise no-answer | Stale/new documents unavailable |
+| Redis cache failure/stale cache | Cache errors, TTL/invalidation or scope/version mismatch | Bypass cache; reauthorize and fetch source; invalidate suspect entries | Rebuild session context or ask user to restate it | Higher latency or lost continuity; not correctness change |
+| Agent/graph node failure | Node timeout/exception, invalid state transition, exhausted deadline | Fail node explicitly; retry only idempotent transient operation; cancel siblings | Route to safe terminal state (clarify/abstain/escalate) | Workflow incomplete; avoid success-shaped fallback |
+| Duplicate Kafka/Event Hubs event | Idempotency key already completed, replay count/checksum mismatch | Acknowledge idempotent no-op; reconcile partial stages | Conflicting checksum/non-retryable poison event to DLQ | Normally none; affected version may be delayed |
+| Partial ingestion/index publication | Expected/actual IDs/counts differ across MongoDB/Qdrant; incomplete stage state | Keep staging generation non-searchable; repair/replay idempotently | Continue prior generation only if effective; else unavailable | Fresh policy content delayed |
+| Prompt injection | Input/document screening signal, tool/scope request mismatch, unusual route | Treat as untrusted data; ignore embedded instructions; enforce auth and filters independently | Refuse unsafe request, clarify, or human review | Request denied/limited; possible reduced capability |
+| PII leakage risk | DLP/PII scan, trace redaction audit or policy classification check | Minimize/mask according to approved policy; prevent raw content trace export | Fail closed when mandatory masking/security control is unavailable | Sensitive workflow unavailable rather than exposed |
+| Hallucination/unsupported claim | Citation/evidence validator, sampled Faithfulness review, complaint or SME finding | Reject or revise only from validated evidence; add confirmed case to regression set | Abstain, clarify or human handoff | Answer withheld/corrected; prevents misleading insurance statement |
+| Unsupported recommendation or eligibility | Candidate not in active catalog, rule/data version mismatch, invalid reason code or unsupported claim | Reject candidate; rerun only after authoritative inputs/rules reconcile | `insufficient_data`, no-match, or advisor review; never let LLM create eligibility | Recommendation unavailable or limited |
+| Recommendation data/catalog/rules dependency failure | Dependency timeout, stale source timestamp, missing catalog version or rule-service error | Apply bounded retry/circuit breaker; validate all versions before ranking | `insufficient_data`/unavailable or advisor handoff; do not use stale cache as eligibility authority | Recommendation delayed or unavailable |
+| No eligible product or insufficient needs data | Deterministic rules return no eligible candidate or required fields are absent | Return approved reason codes; request only missing permitted information | No-match/insufficient-data response; never ask the LLM to invent an eligible product | No recommendation; user may need to supply data or contact an advisor |
+| Unsupported suitability case | Rule coverage missing, regulated situation unresolved, or required human approval absent | Stop automated recommendation and route to authorized review | Advisor/compliance review; no LLM-only suitability conclusion | Longer turnaround, with lower risk of unsuitable guidance |
+| Invalid citation | Unknown ID, unauthorized source, stale version, mismatch with claim/page/offset | Reject the draft and record validation failure | No cited answer; clarification or escalation | User receives safe limitation instead of unsupported citation |
+| Evaluation/telemetry outage | Failed jobs, export errors, dropped spans or backlog | Continue deterministic request gates; pause release promotion; retry background export within retention limits | Serve without optional external trace/evaluator; use Azure operational telemetry | No direct response impact; reduced diagnosis/release evidence |
 
-### Scenario: Offline evaluator or trace platform is unavailable or exposes sensitive data
+### Failure and recovery flow
 
-- **Why it can happen:** Ragas evaluator/model outage, LangSmith export failure, misconfigured sampling, or insufficient redaction/retention controls.
-- **How the architecture detects it:** Evaluation-job failures, export errors, data-loss-prevention alerts, privacy scanning, and trace access audits.
-- **How the system handles/recover from it:** Retry or pause offline evaluation without affecting serving; quarantine unapproved traces, disable export, and follow incident response for exposure.
-- **Fallback behavior:** Continue production with deterministic request-path controls and OTel/Azure telemetry; do not use unreviewed external traces.
-- **Impact on the user/system:** Delayed experiment/release evidence or reduced debugging detail; user responses remain independent of evaluators and trace SaaS.
-- **Monitoring/alerting required:** Alert on evaluation backlog/failures, trace export status, sensitive-data detections, access anomalies, and evaluator version drift.
+```mermaid
+flowchart TD
+    SIGNAL[Request or ingestion failure] --> CLASSIFY{Failure category}
+    CLASSIFY -->|Transient dependency| BUDGET{Deadline / retry budget remains?}
+    BUDGET -->|Yes| RETRY[Backoff with jitter; idempotency key]
+    RETRY --> RECHECK[Recheck dependency, authorization and version]
+    RECHECK -->|Healthy| RESUME[Resume safe workflow stage]
+    RECHECK -->|Still failing| BUDGET
+    BUDGET -->|No| CIRCUIT[Open circuit / stop retries]
+    CLASSIFY -->|Invalid, unsafe or conflicting| REJECT[Fail closed / quarantine]
+    CLASSIFY -->|No or weak evidence| ABSTAIN[Clarify / abstain / human handoff]
+    RESUME --> VALIDATE{All provenance and quality gates pass?}
+    VALIDATE -->|Yes| COMPLETE[Complete answer or activate index]
+    VALIDATE -->|No| REJECT
+    CIRCUIT --> FALLBACK[Safe retry-later or approved human path]
+    REJECT --> AUDIT[Audit IDs, metrics and alert]
+    ABSTAIN --> AUDIT
+    FALLBACK --> AUDIT
+    COMPLETE --> AUDIT
+```
 
-### Scenario: Follow-up reference is ambiguous or rewritten query changes intent
+## 16. Scalability & Performance
 
-- **Why it can happen:** The user changes topics, multiple products or waiting periods were discussed, or the rewriter incorrectly resolves “it”, “that plan”, or another reference.
-- **How the architecture detects it:** Compare the rewritten query and extracted constraints with the current message and relevant turn references; use a confidence threshold and detect competing antecedents.
-- **How the system handles/recover from it:** Preserve the original query, reject an intent-changing rewrite, and ask a targeted clarification when the intended subject cannot be selected reliably.
-- **Fallback behavior:** Do not search or answer against a guessed product or coverage context. The user may restate the subject or start a new topic.
-- **Impact on the user/system:** One additional interaction may be needed; prevents retrieval against the wrong policy.
-- **Monitoring/alerting required:** Measure rewrite confidence, intent-preservation failures, clarification rate, and retrieval/citation quality for follow-up questions.
+Scale API/orchestration, retrieval/reranking and ingestion independently. Ingest asynchronously; use bounded worker pools and provider quotas; apply backpressure, rate limits and admission control. Scale on queue depth/age, consumer lag, API concurrency/latency, CPU/memory, Qdrant query latency and reranker saturation.
 
-### Scenario: Long conversation, stale summary, or summary-generation failure
+For Qdrant, size by chunk/vector count, vector dimensions, payload indexes, filter selectivity, concurrency, replication and backup/restore targets. HNSW tuning and sharding/replication are workload-dependent. Qdrant snapshots/backups and MongoDB backups must have agreed RPO/RTO, tested restore, and cross-store reconciliation before traffic resumes.
 
-- **Why it can happen:** The conversation exceeds the prompt budget, a topic changes, a summary omits a qualifier, or the summarizer/storage dependency fails.
-- **How the architecture detects it:** Track token estimates and summary age/version; retain source-turn references; validate summary fields and compare resolved constraints with recent canonical turns.
-- **How the system handles/recover from it:** Rebuild summaries from canonical turns, segment by topic, and retrieve only relevant scoped history. Apply the defined trimming order and never truncate required policy evidence or safety instructions.
-- **Fallback behavior:** Use the bounded recent-turn window if the summary is unavailable; if required context no longer fits or cannot be verified, ask the user to restate it.
-- **Impact on the user/system:** May add latency or require restatement, while keeping prompt size bounded and preventing lost qualifications from silently affecting the answer.
-- **Monitoring/alerting required:** Track summary refresh failures/age, token-budget overruns, history-retrieval latency, context-trim counts, and clarification/restatement rates.
+Latency/cost controls: direct retrieval for simple FAQs; parallelize independent authorized reads; cap query expansion, candidate count and reranker input; avoid repeated model calls; use Redis only as a bounded, scope-aware cache. Do not degrade authorization, evidence validation or citation requirements to meet latency.
 
-### Scenario: Conversation history is inaccessible, revoked, or belongs to another scope
+### Reliability and disaster recovery
 
-- **Why it can happen:** Conversation ownership changes, session IDs are guessed or reused, permissions are revoked, cache keys omit scope, or history storage is unavailable.
-- **How the architecture detects it:** Reauthorize every history read against user, tenant, conversation, and customer scope; validate cache metadata and reject missing ownership/version claims.
-- **How the system handles/recover from it:** Fail closed for unauthorized history, invalidate affected cached context, and emit a security audit event. For storage outages, use only history already loaded and verified in the current request if policy permits.
-- **Fallback behavior:** Treat the latest message as standalone or request the user to restate context; never borrow history from a different conversation or tenant.
-- **Impact on the user/system:** Reduced continuity or a clarification step; no cross-session or cross-tenant disclosure.
-- **Monitoring/alerting required:** Alert on denied history access, cache-scope mismatch, history-store outages, and anomalous conversation-ID access patterns.
+Keep immutable source documents and extraction artifacts in durable Blob storage; back up MongoDB lineage and Qdrant snapshots under approved retention. Define RPO/RTO per business workflow, document dependency-ordered recovery, and rehearse restore/failover. After restoration, reconcile MongoDB document/version/chunk manifests against Qdrant vectors and active-generation markers before enabling retrieval. If integrity or freshness cannot be proven, keep the affected corpus/workflow disabled and route users to a safe unavailable response or human support. Region-level failover, replica layout and recovery objectives are not specified or tested by this architecture.
 
----
+**Not yet measured:** p50/p95/p99 end-to-end and per-stage latency, capacity at thousands of files and expected concurrency, extraction/embedding throughput and quotas, Qdrant HNSW recall/memory, failover performance, RTO/RPO, and cost per successful workflow. Establish from representative load/failure tests.
+
+## 17. Observability & Evaluation
+
+### Production observability
+
+OpenTelemetry with Azure Monitor/Application Insights is the operational source of truth. Record correlation IDs and opaque evidence/source/version IDs, route, model/prompt/retrieval configuration versions, per-stage latency/errors, token/cost, retries, cache outcome, index freshness, retrieval scores, no-hit/low-confidence, citation rejection, guardrail results, clarification, abstention, escalation and recommendation outcomes. Do not place raw conversation/PII/full passages in ordinary logs. Export to LangSmith only after privacy, residency, access and retention approval; export failure must not block serving.
+
+### Offline evaluation
+
+Ragas is recommended for versioned SME-reviewed evaluation sets:
+
+- **Faithfulness:** whether answer claims are supported by supplied context; not proof that context itself is authoritative.
+- **Answer Relevancy:** whether the response addresses the actual intent, including suitable clarification/refusal.
+- **Context Precision:** whether retrieved/reranked evidence is useful; interpret alongside recall.
+- **Context Recall:** whether all required expected evidence, including exclusions/qualifiers, was retrieved.
+
+Also test deterministic authorization, current-version selection, citation resolution, structured schema, disclosures, rules and reason codes. Segment results by product, jurisdiction, channel, workflow and policy version; pin dataset/evaluator/model versions; calibrate LLM judge metrics against insurance SMEs. Do not release on a single aggregate score.
+
+For recommendations, separately regression-test rule versions, eligibility outcomes, reason codes, catalog-effective dates, no-match/insufficient-data behavior and candidate explanations against business-approved cases. Ragas does not validate deterministic suitability or rule correctness.
+
+### Feedback and improvement
+
+User/advisor feedback and sampled human review are investigation signals, not automatic labels. Privacy-screen and triage confirmed cases; add SME-approved cases to a versioned regression set; evaluate retrieval, chunking, routing, rules, prompts and models; require quality/safety/latency gates and owner approval; canary and monitor; rollback on regression. No automatic online learning or prompt mutation is specified.
+
+## 18. End-to-End Examples
+
+### Example A: Conversational policy Q&A
+
+Conversation: user and assistant discussed Health Plus; the user asks, “What about the waiting period?”
+
+1. API authenticates the caller and authorizes the customer/policy scope.
+2. Router detects an ambiguous follow-up and loads only bounded, same-conversation history.
+3. Rewriter proposes “What waiting period applies under the Health Plus policy?” with source turn IDs and confidence; if uncertain, it asks which policy.
+4. Retrieval applies trusted jurisdiction, product, effective-date and version filters; searches Qdrant and optional synchronized BM25; fuses, deduplicates, reranks with BGE.
+5. Evidence gate detects whether waiting period and exception clauses are both present. Missing/conflicting evidence triggers clarification or advisor review.
+6. Context builder adds only required current customer facts (if personalized), evidence, concise history, fixed instructions and output schema.
+7. LLM drafts a structured explanation using evidence IDs; NeMo/application controls and server validator check schema, provenance and citations.
+8. The response cites the effective policy version/section/page and distinguishes contract facts from explanation.
+
+### Example B: Product recommendation
+
+An authorized advisor posts to `/api/v1/recommendations` with an opaque customer reference and stated needs. The endpoint validates identity/purpose, fetches profile/current policies/coverage/claims facts and active catalog version, then runs eligibility/suitability rules. Only eligible candidates are ranked under approved business criteria. RAG retrieves current product wording, limitations, exclusions and waiting periods. The optional LLM explains already validated results; server validation checks product IDs, catalog/rule versions, reason codes, citations and disclosures. Missing data, rule/catalog conflict, or unsupported suitability causes `insufficient_data`, no recommendation or human review. The LLM cannot create a candidate or decide eligibility.
+
+## 19. Architecture Decisions / Trade-offs
+
+| Decision | Recommendation | Trade-off / reason |
+|---|---|---|
+| Azure AI Document Intelligence | Retain for OCR/layout/table/form extraction | Better structure input for chunking/citations; extraction cost and quality gates remain |
+| Structure-aware chunking and rich provenance | Recommended | More ingestion complexity/index metadata, but preserves clauses, exceptions and source traceability |
+| Qdrant dense search with trusted metadata filters | Retain | Focused vector capability; separate backup, tuning and consistency burden |
+| BM25/lexical hybrid | Recommended when a synchronized index is available and measured | Exact terminology recall improves; adds index operations/fusion/partial-failure complexity |
+| BGE cross-encoder | Retain | Better candidate ordering; adds bounded inference latency/cost and cannot recover missing candidates |
+| MMR | Optional, measured only | Reduces duplicates but may remove legally complementary clauses |
+| Contextual compression | Optional, extractive only and budget-triggered | Saves tokens but can drop qualifiers; preserve offsets and source chunk |
+| Conditional rewriting | Recommended for ambiguous follow-ups only | Improves reference resolution; can change intent and add a model round trip |
+| Multi-query generation | Optional for complex decomposable questions only | Recall may improve; fan-out, latency and noise increase |
+| LangGraph | Retain as controlled workflow | Explicit routing/state, but replay/checkpoint and node failure require controls |
+| NeMo Guardrails | Retain as configured guardrail layer | Useful dialogue safety; not authorization, PII, rule or citation validation |
+| Presidio/DLP | Optional implementation for classification-driven PII needs | Complementary to NeMo; adds latency and recognizer maintenance; not currently selected |
+| Redis | Optional cache/session acceleration | Lower latency, but invalidation/scope collision risk; never authoritative |
+| MongoDB durable conversation history | Conditional on governance | Continuity/audit benefit vs sensitive retention/deletion burden |
+| Ragas | Recommended offline | Quality measurement with SME data; judge scores are estimates and add batch cost |
+| LangSmith | Optional | LLM experiment UX overlaps OTel; privacy/vendor and export outage controls required |
+| Multimodal LLM/VLM | Not by default | Document Intelligence covers expected OCR/layout; add only for a proven visual-semantic use case |
+| Multiple autonomous specialist agents | Not by default | Deterministic services/rules are more auditable for authorization and eligibility |
+
+Optimize accuracy, grounding, explainability, reliability, latency, cost and maintainability—not the count of techniques.
+
+## 20. Production Readiness Checklist
+
+### Data and ingestion
+
+- [ ] Approved source-of-truth owners, supported file allowlist/limits, languages and OCR/table acceptance thresholds are documented.
+- [ ] Page/section offsets, effective dates, access metadata, document/chunker/embedding/index versions and stable citation IDs are validated.
+- [ ] Duplicate events/uploads are idempotent; poison events have owned DLQ and replay procedures.
+- [ ] Staged Qdrant/MongoDB versions reconcile before atomic activation; rollback and delete propagation are tested.
+- [ ] Cross-document reference resolution limits are documented; no unsupported link-following is implied.
+
+### Retrieval, Q&A and recommendation
+
+- [ ] ACL/version/date filters are derived from trusted context and tested against cross-tenant leakage.
+- [ ] Hybrid lexical index is deployed/synchronized or architecture is explicitly semantic-only.
+- [ ] BGE candidate limits, timeout and fallback/abstention thresholds are evaluated.
+- [ ] No-evidence, low-confidence, ambiguity, conflicting source and expired-policy paths are tested.
+- [ ] Recommendation endpoint, catalog, eligibility/suitability rules, ranking ownership, freshness, disclosures and audit contract are approved.
+- [ ] LLM cannot determine eligibility, invent products, facts or citations; all are server-validated.
+
+### Security, reliability and operations
+
+- [ ] Data minimization, PII classes, approved detector/DLP, masking/restoration, retention, deletion, residency and trace controls are approved.
+- [ ] Prompt-injection tests cover user input, retrieved documents and conversation summaries.
+- [ ] Per-dependency deadlines, bounded retry/backoff, circuit breakers, admission control and side-effect idempotency are verified.
+- [ ] Redis is non-authoritative and cache keys/TTLs/invalidation include authorization and source-version scope.
+- [ ] LangGraph state/checkpoint persistence, encryption, retention and replay are explicitly selected or disabled.
+- [ ] Qdrant HNSW/payload/shard/replica settings, backups, MongoDB backups, RPO/RTO, restore drills and cross-store recovery are validated.
+- [ ] Capacity/performance load tests cover thousands of documents, chunk count, expected concurrency, burst ingestion, re-index overlap, p95 latency and cost.
+- [ ] OTel/Azure alerts cover stage errors/latency/cost, queue lag/DLQ, stale index, no-hit/low confidence, citation rejects, safety events and recommendation outcomes.
+- [ ] Ragas gold-set coverage and release thresholds are SME-reviewed, versioned and calibrated; feedback requires triage and approval before entering regression sets.
+- [ ] Canary, rollback, incident ownership, human escalation and service-unavailable user messaging are exercised.

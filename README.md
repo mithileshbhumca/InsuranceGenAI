@@ -749,7 +749,7 @@ This parent README is the top-level reference. Supporting design documents are l
 
 ### Detailed document coverage
 
-- [rag-architecture.md](./rag-architecture.md): retrieval, reranking, chunking, citation strategy, and RAG evaluation
+- [rag-architecture.md](./rag-architecture.md): end-to-end enterprise RAG, document ingestion, query/retrieval, conversational Q&A, product recommendations, security, cost controls, failure handling, and evaluation
 - [deployment-architecture.md](./deployment-architecture.md): cloud deployment, AKS, storage, monitoring, and production operations
 - [backend-architecture.md](./backend-architecture.md): service responsibilities, FastAPI backend design, and dependency model
 - [24-rag-enhancement-decisions.md](./docs/architecture/24-rag-enhancement-decisions.md): item-by-item evaluation, trade-offs, final retrieval strategy, and Principal Architect review
