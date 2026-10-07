@@ -532,3 +532,89 @@ flowchart TD
 ```
 
 This diagram highlights the backend service interactions, dependency chain, and the data flow that supports secure, policy-aware responses and asynchronous ingestion work.
+
+---
+
+## 17. Edge Case & Failure Handling
+
+The backend must treat authorization, customer context, policy evidence, and response validation as correctness gates. Timeouts and dependency errors must be visible and must not be converted into successful-looking but incomplete answers.
+
+### Scenario: Invalid, expired, or incomplete identity/authorization context
+
+- **Why it can happen:** Expired or malformed tokens, identity-provider outage, missing role/tenant claims, or stale policy/customer relationship data.
+- **How the architecture detects it:** Authentication middleware validates issuer, signature, audience, and expiry; authorization checks required claims and customer scope before accessing data.
+- **How the system handles/recover from it:** Reject invalid credentials; refresh only through the approved identity flow; retry identity-provider errors only when transient and within request deadlines. Do not retry a policy denial as a service error.
+- **Fallback behavior:** Return a generic unauthorized/forbidden response without revealing whether the requested policy or claim exists.
+- **Impact on the user/system:** Request cannot proceed until credentials or access are corrected; protected data remains unavailable.
+- **Monitoring/alerting required:** Track authentication failures separately from access denials; alert on identity-provider latency/outage and anomalous tenant/role access patterns.
+
+### Scenario: Customer context or policy/claims system times out or returns stale data
+
+- **Why it can happen:** Upstream service degradation, network timeout, rate limiting, stale replica, or incompatible response schema.
+- **How the architecture detects it:** Per-dependency deadlines, response schema and freshness checks, circuit-breaker state, and source timestamps.
+- **How the system handles/recover from it:** Use bounded retries with backoff for transient failures; validate data contracts; open the circuit during sustained failure and emit a correlated trace. Do not use stale customer data unless explicitly permitted by the business freshness policy.
+- **Fallback behavior:** Continue only with a public/general policy answer when retrieval authorization and response wording make that safe; otherwise request retry or route to an advisor. Never present a general answer as customer-specific.
+- **Impact on the user/system:** Personalized eligibility or claims flows may be unavailable; non-customer-specific FAQs may continue.
+- **Monitoring/alerting required:** Alert on upstream error rate, timeout rate, freshness lag, circuit-breaker opens, and schema-validation failures.
+
+### Scenario: Qdrant or retrieval dependency is unavailable
+
+- **Why it can happen:** Vector service outage, network partition, index overload, deployment issue, or shard/replica failure.
+- **How the architecture detects it:** Connection/query timeouts, readiness checks, retrieval latency and error metrics, and missing-index/version validation.
+- **How the system handles/recover from it:** Apply bounded retry and circuit-breaker behavior; restore connectivity or fail over to a validated replica/index when configured; preserve correlation IDs and retrieval diagnostics.
+- **Fallback behavior:** Do not generate policy claims without evidence. Return an explicit temporary-unavailable/no-evidence response or initiate human review.
+- **Impact on the user/system:** RAG questions fail safely; unrelated session and administrative features may remain available.
+- **Monitoring/alerting required:** Alert on Qdrant health, query errors/latency, replica status, index freshness, and no-evidence rate changes.
+
+### Scenario: LLM provider throttles, times out, or returns malformed output
+
+- **Why it can happen:** Provider outage, rate/token limits, transient network errors, model change, or output exceeding the expected schema.
+- **How the architecture detects it:** Request deadlines, provider status/error codes, token-budget checks, structured-output parsing, and schema validation.
+- **How the system handles/recover from it:** Retry only transient errors with bounded exponential backoff and jitter; honor rate-limit retry guidance; use an approved lower-cost/backup model only if it has passed governance and quality evaluations; capture model/configuration identifiers.
+- **Fallback behavior:** Return a safe retry message or advisor handoff; never return partial or malformed generated text as a completed answer.
+- **Impact on the user/system:** Increased latency, temporary loss of generative responses, or escalation; API remains responsive within its deadline budget.
+- **Monitoring/alerting required:** Alert on provider error and throttle rates, latency, token-budget exhaustion, invalid structured outputs, fallback model usage, and cost anomalies.
+
+### Scenario: Redis session/cache outage or cache contains stale data
+
+- **Why it can happen:** Redis failover, network interruption, memory pressure, eviction, TTL/configuration error, or cache key omits authorization/version scope.
+- **How the architecture detects it:** Cache connection errors, hit/miss and eviction metrics, TTL checks, and verification of cached customer, tenant, and document-version metadata.
+- **How the system handles/recover from it:** Treat cache as non-authoritative; bypass it and read from the source of truth when safe. Invalidate entries after permission or document-version changes; use scoped keys and bounded TTLs.
+- **Fallback behavior:** Reconstruct session context or require the user to restate lost context; if authorization scope cannot be re-established, do not serve cached customer data.
+- **Impact on the user/system:** Higher latency or loss of conversational continuity; no correctness or access decision relies solely on cache.
+- **Monitoring/alerting required:** Monitor Redis availability, memory/evictions, cache hit rate, invalidation lag, and detected scope/version mismatches.
+
+### Scenario: Request overload, timeout cascade, or duplicate async job
+
+- **Why it can happen:** Traffic spike, retry storm, slow dependencies, unbounded request concurrency, at-least-once queue delivery, or worker restart after partial completion.
+- **How the architecture detects it:** Gateway rate limits, request queue depth, latency/error SLOs, dependency saturation, worker heartbeat, duplicate idempotency key, and queue age.
+- **How the system handles/recover from it:** Apply admission control, per-dependency deadlines, bounded concurrency and backpressure; use idempotency keys for jobs and writes; retry transient failures with capped backoff; route poison messages to a dead-letter queue.
+- **Fallback behavior:** Return a clear throttled/retry-later response for interactive traffic; preserve document jobs durably for replay instead of holding requests open.
+- **Impact on the user/system:** Some requests are delayed or rejected under overload, while bounded work prevents cascading failure and duplicate indexing.
+- **Monitoring/alerting required:** Alert on saturation, queue depth/age, timeout cascades, retries, throttling, duplicate jobs, dead-letter volume, and worker restarts.
+
+### Backend dependency recovery flow
+
+```mermaid
+flowchart TD
+    Req[Validated request] --> Call[Call dependency with deadline]
+    Call --> Result{Dependency result}
+    Result -- Success --> Validate[Validate freshness, schema and authorization scope]
+    Result -- Transient error --> Retry{Retry budget remains?}
+    Retry -- Yes --> Backoff[Backoff with jitter]
+    Backoff --> Call
+    Retry -- No --> Circuit[Open circuit / mark dependency unhealthy]
+    Result -- Denied or invalid --> Reject[Fail closed and audit]
+    Validate --> Good{Valid result?}
+    Good -- Yes --> Continue[Continue workflow]
+    Good -- No --> Reject
+    Circuit --> Fallback{Safe fallback available?}
+    Fallback -- Yes --> Limited[Return limited answer or use approved alternative]
+    Fallback -- No --> Escalate[Return unavailable or route to human review]
+    Limited --> Audit[(Correlated audit and telemetry)]
+    Escalate --> Audit
+    Reject --> Audit
+    Continue --> Audit
+```
+
+This flow bounds retries by a deadline and prevents invalid or unauthorized dependency results from entering the model context. A fallback is used only when it is explicitly safe; otherwise, the request fails visibly and is audited.

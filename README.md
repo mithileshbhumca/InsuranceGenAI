@@ -697,7 +697,71 @@ This parent README is the top-level reference. Supporting design documents are l
 
 ---
 
-## 27. Final Summary
+## 27. Edge Case & Failure Handling
+
+The system must fail safely: it should not return customer-specific coverage conclusions when authorization, source freshness, evidence quality, or validation cannot be established. Detailed component-specific scenarios are documented in the [RAG architecture](./rag-architecture.md), [deployment architecture](./deployment-architecture.md), and [backend architecture](./backend-architecture.md).
+
+### Scenario: Customer or advisor is not authorized for requested data
+
+- **Why it can happen:** Expired credentials, missing role claims, incorrect customer-policy association, or an authorization service outage.
+- **How the architecture detects it:** Identity token validation and an authorization check fail, time out, or return no matching customer relationship.
+- **How the system handles/recover from it:** Deny access before retrieving customer data; refresh identity context only through the approved identity flow. Do not retry an authorization denial as if it were transient.
+- **Fallback behavior:** Return a generic access error or direct the user to the supported service channel; do not reveal whether another customer or policy exists.
+- **Impact on the user/system:** The user cannot complete that customer-specific request; no protected data is disclosed.
+- **Monitoring/alerting required:** Track authorization denials and dependency errors separately; alert on spikes, latency, and possible cross-tenant access anomalies.
+
+### Scenario: Policy source is stale, conflicting, or not fully indexed
+
+- **Why it can happen:** A new policy version arrives while indexing is incomplete, document metadata is incorrect, or a superseded source remains searchable.
+- **How the architecture detects it:** Version/effective-date filters and ingestion validation identify missing, stale, duplicate, or conflicting versions; query evaluation can detect no current-version evidence.
+- **How the system handles/recover from it:** Keep the new version unavailable until indexing and metadata validation pass; retain the previous approved version only when its effective period applies; reprocess or correct the source with lineage intact.
+- **Fallback behavior:** State that current policy evidence is unavailable and route the user to an advisor rather than infer coverage from a stale document.
+- **Impact on the user/system:** Answer may be delayed or escalated; prevents materially incorrect policy guidance.
+- **Monitoring/alerting required:** Alert on ingestion age, index/version mismatch, validation failure, and searches with no current-version result.
+
+### Scenario: Critical dependency is unavailable or degraded
+
+- **Why it can happen:** Regional or zone outage, network failure, rate limiting, resource exhaustion, or a managed service incident affects the LLM, vector store, customer systems, or event broker.
+- **How the architecture detects it:** Timeouts, health/readiness probes, dependency error rates, queue lag, circuit-breaker state, and latency SLO breaches.
+- **How the system handles/recover from it:** Apply bounded retries with backoff for transient errors, circuit-break failing dependencies, use redundant instances or replayable queues where configured, and restore/reprocess from durable source data.
+- **Fallback behavior:** Disable only the affected capability when safe. Do not provide customer-specific answers if customer context is unavailable; offer a retry or human handoff.
+- **Impact on the user/system:** Reduced functionality or slower response, while unaffected APIs and ingestion work may continue.
+- **Monitoring/alerting required:** Alert on SLO breaches, dependency health, circuit-breaker state, queue depth/age, and recovery/replication lag.
+
+### Scenario: Answer generation or validation fails
+
+- **Why it can happen:** Model timeout or malformed output, prompt/configuration regression, insufficient evidence, citation mismatch, or guardrail service failure.
+- **How the architecture detects it:** Structured-output/schema validation, groundedness and citation checks, safety outcomes, model timeouts, and evaluation/quality metrics.
+- **How the system handles/recover from it:** Retry only transient model errors within a request budget; reject invalid drafts; preserve trace data; roll back a bad prompt/model configuration; route sensitive or repeatedly invalid cases to review.
+- **Fallback behavior:** Return a safe limitation or escalation response; never return an unvalidated answer as success.
+- **Impact on the user/system:** The user receives a limited answer or human handoff instead of potentially misleading advice.
+- **Monitoring/alerting required:** Alert on model errors, validation rejection rate, citation failures, safety-trigger trends, and answer-quality regressions.
+
+### Cross-system recovery path
+
+```mermaid
+flowchart LR
+    Request[Request or ingestion event] --> Check{Identity, dependencies and data healthy?}
+    Check -- Yes --> Process[Process with access and quality gates]
+    Check -- No --> Classify{Failure type?}
+    Classify -- Transient --> Budget{Retry budget remains?}
+    Budget -- Yes --> Backoff[Backoff / circuit-breaker policy]
+    Backoff --> Check
+    Budget -- No --> Circuit[Open circuit and notify operations]
+    Classify -- Invalid or unsafe --> Reject[Fail closed / quarantine / human review]
+    Process --> Validate{Validation passes?}
+    Validate -- Yes --> Complete[Return cited response / publish index]
+    Validate -- No --> Reject
+    Circuit --> Fallback[Retry later or human handoff]
+    Reject --> Alert[Audit, metrics and operational alert]
+    Fallback --> Alert
+```
+
+The system retries only recoverable transient failures; invalid or unsafe states fail closed. Durable source documents, queues, audit records, and versioned configuration support replay and rollback without silently changing the basis of an answer.
+
+---
+
+## 28. Final Summary
 
 The Insurance AI Assistant is designed as a secure, production-grade AI system that brings together enterprise knowledge retrieval, policy-aware reasoning, customer context integration, and robust governance. It is optimized for insurance use cases where accuracy, traceability, policy compliance, explainability, and operational safety are essential.
 

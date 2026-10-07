@@ -525,3 +525,82 @@ flowchart LR
 ```
 
 This diagram illustrates the deployment dependencies, service interactions, and the operational separation between user-facing services and document ingestion workloads.
+
+---
+
+## 17. Edge Case & Failure Handling
+
+Deployment recovery should preserve data integrity and security before availability. Recovery objectives (RTO/RPO), regional failover behavior, and backup retention must be set by business and regulatory requirements and validated through exercises.
+
+### Scenario: Pod, node, or availability-zone disruption
+
+- **Why it can happen:** Node failure, zone outage, memory pressure, bad health checks, or application crash.
+- **How the architecture detects it:** Kubernetes liveness/readiness probes, pod restart events, node/zone health, error rates, and service-level latency/availability metrics.
+- **How the system handles/recover from it:** Run multiple replicas across zones, reschedule workloads, use autoscaling within capacity limits, and drain unhealthy nodes; use disruption budgets for planned maintenance.
+- **Fallback behavior:** Route traffic to healthy replicas. If the region or all replicas are unavailable, return a controlled service-unavailable response rather than routing around authorization or validation.
+- **Impact on the user/system:** A brief increase in latency or request failures; ingestion jobs may pause and resume.
+- **Monitoring/alerting required:** Alert on unavailable replicas, repeated restarts, node pressure, zone capacity, pod scheduling failures, and API SLO breaches.
+
+### Scenario: Regional or stateful data-service outage
+
+- **Why it can happen:** Cloud-region incident, storage/database outage, network partition, or corrupted/unavailable vector or metadata store.
+- **How the architecture detects it:** Managed service health, connection and query failures, replication lag, storage health, and readiness checks from dependent services.
+- **How the system handles/recover from it:** Use configured backups/replicas and documented regional recovery runbooks; restore services in dependency order; validate MongoDB/Qdrant consistency and document version state before reopening traffic.
+- **Fallback behavior:** Do not serve customer-specific or policy answers if source metadata, authorization context, or retrieval correctness cannot be confirmed. Offer retry or human support.
+- **Impact on the user/system:** Reduced or unavailable AI functionality during recovery; possible delayed ingestion. Data recovery time depends on the agreed RTO/RPO.
+- **Monitoring/alerting required:** Alert on provider health, replication/backup failures, restore test results, data-service latency, and cross-store consistency.
+
+### Scenario: Event broker backlog or ingestion worker failure
+
+- **Why it can happen:** Upload burst, downstream Document Intelligence throttling, worker crash, malformed message, or poison event.
+- **How the architecture detects it:** Queue depth and oldest-message age, consumer lag, worker error/retry counts, dead-letter volume, and ingestion completion SLOs.
+- **How the system handles/recover from it:** Scale workers within quotas; use bounded retries with backoff; make handlers idempotent; isolate poison messages in a dead-letter queue for diagnosis; replay after correction.
+- **Fallback behavior:** Keep source files durable in Blob Storage and mark affected versions as processing or failed, not searchable. Existing validated versions continue only if still effective.
+- **Impact on the user/system:** New or revised documents become searchable later; existing approved content remains available when valid.
+- **Monitoring/alerting required:** Alert on queue growth/age, dead-letter messages, worker saturation, repeated retries, and indexing freshness.
+
+### Scenario: Key Vault, identity, DNS, or private-network path unavailable
+
+- **Why it can happen:** Identity-provider issue, Key Vault throttling/outage, expired certificate, DNS failure, private endpoint/network misconfiguration, or firewall change.
+- **How the architecture detects it:** Startup/readiness checks, credential acquisition errors, DNS/connectivity probes, TLS failures, and dependency timeouts.
+- **How the system handles/recover from it:** Use managed identity and approved secret refresh/retry behavior; rotate or repair configuration through controlled deployment; do not cache credentials beyond their approved lifetime or bypass private-network controls.
+- **Fallback behavior:** Fail closed for services that cannot establish identity or secure connectivity; keep unrelated healthy capabilities operating if isolation is safe.
+- **Impact on the user/system:** Some or all APIs and ingestion workers may become unavailable until secure connectivity is restored.
+- **Monitoring/alerting required:** Alert on token acquisition and Key Vault failures, certificate expiry, private endpoint health, DNS/TLS errors, and sudden auth failures.
+
+### Scenario: Failed or harmful production deployment
+
+- **Why it can happen:** Defective image, incompatible schema/configuration, broken readiness probe, infrastructure drift, or an application/prompt change that degrades safety or quality.
+- **How the architecture detects it:** Deployment health gates, smoke/integration tests, canary metrics, error and latency regressions, RAG evaluation, and safety/validation rejection rates.
+- **How the system handles/recover from it:** Halt progressive rollout; roll back the application/configuration to the last known-good version; use backward-compatible database changes and forward-fix data migrations under change control.
+- **Fallback behavior:** Keep unaffected services and the last approved model/prompt configuration active; if safe behavior cannot be established, disable the affected workflow and direct users to human support.
+- **Impact on the user/system:** A temporary feature outage or degraded experience; rollback limits blast radius and prevents unsafe answers.
+- **Monitoring/alerting required:** Alert on rollout health gates, canary SLOs, rollback events, configuration drift, and AI quality/safety regressions.
+
+### Deployment recovery flow
+
+```mermaid
+flowchart TD
+    Signal[Health probe, SLO or queue alert] --> Triage{Classify affected tier}
+    Triage --> App[Application / AKS]
+    Triage --> Data[Data / storage]
+    Triage --> Ingest[Event / ingestion]
+    Triage --> Security[Identity / network / secrets]
+
+    App --> AppRecovery[Reschedule or scale healthy replicas]
+    Data --> DataRecovery[Fail over or restore from validated backup]
+    Ingest --> IngestRecovery[Pause publication, retry or replay idempotent jobs]
+    Security --> SecRecovery[Repair trusted identity/network configuration]
+
+    AppRecovery --> Verify[Run readiness, security and data-integrity checks]
+    DataRecovery --> Verify
+    IngestRecovery --> Verify
+    SecRecovery --> Verify
+    Verify --> Ready{Recovery validated?}
+    Ready -- Yes --> Resume[Resume traffic or document publication]
+    Ready -- No --> Safe[Keep affected capability disabled and escalate]
+    Resume --> Incident[Record incident, recovery time and follow-up]
+    Safe --> Incident
+```
+
+This flow makes recovery ownership explicit: classify the impacted tier, use tier-appropriate recovery, and restore traffic or publication only after health, security, and data-integrity checks pass.
