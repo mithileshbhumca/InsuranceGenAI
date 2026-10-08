@@ -34,7 +34,11 @@ The LLM interprets language and explains validated inputs; it is not a policy sy
 
 ### Data and source-of-truth boundaries
 
-**System roles:** CRM (Customer Relationship Management) holds customer profile and relationship information; the policy administration system holds policy, coverage, status and effective-date records; the claims system holds claim submissions, status, decisions and history. These are role descriptions, not confirmation that specific products or APIs are integrated. The assistant reads relevant facts through authorized enterprise services; these systems remain authoritative.
+- **CRM (Customer Relationship Management):** customer profiles, contact details, preferences, and advisor/customer relationship information.
+- **Policy administration system:** policy records, products, coverage, effective dates, renewals, and policy status.
+- **Claims system:** claim submissions, processing status, decisions, and claim history.
+
+The assistant should retrieve relevant data from these systems through authorized APIs when needed.
 
 | Data | Authoritative source | Derived or runtime store |
 |---|---|---|
